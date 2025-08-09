@@ -67,6 +67,25 @@
 
 using namespace Napi;
 
+// ---------------- UTF-8 / UTF-16 helpers ----------------
+static std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (sizeNeeded <= 0) return std::string();
+    std::string result((size_t)sizeNeeded, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), result.data(), sizeNeeded, nullptr, nullptr);
+    return result;
+}
+
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (sizeNeeded <= 0) return std::wstring();
+    std::wstring result((size_t)sizeNeeded, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), result.data(), sizeNeeded);
+    return result;
+}
+
 struct WindowInfo {
     HWND hwnd;
     std::string title;
@@ -222,13 +241,13 @@ std::string GetExecutablePath(HWND hwnd) {
 
     // Zuerst: minimale Rechte, funktioniert häufig auch bei erhöhten Prozessen
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
-    char pathA[MAX_PATH] = {0};
     if (hProcess) {
+        WCHAR pathW[MAX_PATH] = {0};
         DWORD size = MAX_PATH;
-        if (QueryFullProcessImageNameA(hProcess, 0, pathA, &size)) {
-            std::string result(pathA, size);
+        if (QueryFullProcessImageNameW(hProcess, 0, pathW, &size)) {
+            std::wstring w(pathW, size);
             CloseHandle(hProcess);
-            return result;
+            return WideToUtf8(w);
         }
         CloseHandle(hProcess);
     }
@@ -236,9 +255,10 @@ std::string GetExecutablePath(HWND hwnd) {
     // Fallback: erweiterte Rechte (kann bei fehlenden Rechten fehlschlagen)
     hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
     if (hProcess) {
-        if (GetModuleFileNameExA(hProcess, NULL, pathA, MAX_PATH)) {
+        WCHAR pathW[MAX_PATH] = {0};
+        if (GetModuleFileNameExW(hProcess, NULL, pathW, MAX_PATH)) {
             CloseHandle(hProcess);
-            return std::string(pathA);
+            return WideToUtf8(std::wstring(pathW));
         }
         CloseHandle(hProcess);
     }
@@ -247,19 +267,22 @@ std::string GetExecutablePath(HWND hwnd) {
 
 // Fenster-Titel ermitteln
 std::string GetWindowTitle(HWND hwnd) {
-    char title[256];
-    int len = GetWindowTextA(hwnd, title, sizeof(title));
-    if (len > 0) {
-        return std::string(title);
-    }
-    return "";
+    int len = GetWindowTextLengthW(hwnd);
+    if (len <= 0) return "";
+    std::wstring wtitle;
+    wtitle.resize((size_t)len);
+    int got = GetWindowTextW(hwnd, &wtitle[0], len + 1);
+    if (got <= 0) return "";
+    // In case GetWindowTextW wrote a null terminator inside
+    if ((size_t)got < wtitle.size()) wtitle.resize((size_t)got);
+    return WideToUtf8(wtitle);
 }
 
 // Fensterklasse ermitteln
 std::string GetWindowClassName(HWND hwnd) {
-    char className[256] = {0};
-    int len = GetClassNameA(hwnd, className, sizeof(className));
-    if (len > 0) return std::string(className);
+    WCHAR className[256] = {0};
+    int len = GetClassNameW(hwnd, className, (int)(sizeof(className)/sizeof(className[0])));
+    if (len > 0) return WideToUtf8(std::wstring(className, len));
     return "";
 }
 
@@ -267,7 +290,7 @@ std::string GetWindowClassName(HWND hwnd) {
 std::string GetFirstChildTitle(HWND hwnd) {
     HWND child = GetWindow(hwnd, GW_CHILD);
     while (child) {
-        int len = GetWindowTextLengthA(child);
+        int len = GetWindowTextLengthW(child);
         if (len > 0) {
             std::string t = GetWindowTitle(child);
             if (!t.empty()) return t;
@@ -447,7 +470,8 @@ std::string GetWindowIconBase64(HWND hwnd, const std::string& exePath, int size 
     HICON extracted = NULL;
     if (!hIcon && !exePath.empty()) {
         // Let Windows pick the best icon from the file
-        ExtractIconExA(exePath.c_str(), 0, NULL, &extracted, 1);
+        std::wstring wpath = Utf8ToWide(exePath);
+        ExtractIconExW(wpath.c_str(), 0, NULL, &extracted, 1);
         if (extracted) hIcon = extracted;
     }
 
@@ -753,7 +777,7 @@ static bool IsAltTabEligible(HWND hwnd, bool includeAllDesktops) {
     }
 
     // Fenster ohne Titel normalerweise nicht in Alt-Tab, außer für UWP-Host/Explorer/WhatsApp
-    if (GetWindowTextLengthA(hwnd) <= 0) {
+    if (GetWindowTextLengthW(hwnd) <= 0) {
         std::string cls = GetWindowClassName(hwnd);
         if (_stricmp(cls.c_str(), "ApplicationFrameWindow") != 0 &&
             !IsExplorerWindow(hwnd) && !IsWhatsAppWindow(hwnd)) {
