@@ -51,6 +51,28 @@ Brings a window to the foreground and focuses it.
 #### `updateThumbnail(windowId: number): string`
 Refreshes and returns the PNG thumbnail as a base64 data URL.
 
+### Async API (non-blocking)
+
+Promise-based variants that run work off the main thread and won't block the event loop:
+
+- `getWindowsAsync(options?): Promise<WindowInfo[]>`
+- `getVisibleWindowsAsync(options?): Promise<WindowInfo[]>`
+- `openWindowAsync(windowId: number): Promise<boolean>`
+- `updateThumbnailAsync(windowId: number): Promise<string>`
+
+Example:
+
+```ts
+import dwmWindows from 'dwm-windows';
+
+const all = await dwmWindows.getWindowsAsync({ includeAllDesktops: true });
+if (all.length) {
+  await dwmWindows.openWindowAsync(all[0].id);
+  const freshThumb = await dwmWindows.updateThumbnailAsync(all[0].id);
+  console.log('Thumb length:', freshThumb.length);
+}
+```
+
 ### Filter Methods
 
 #### `getWindowsByTitle(titleFilter: string): WindowInfo[]`

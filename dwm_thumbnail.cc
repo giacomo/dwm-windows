@@ -42,6 +42,7 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_map>
+#include <mutex>
 
 // PrintWindow Flags definieren falls nicht verfügbar
 #ifndef PW_RENDERFULLCONTENT
@@ -111,6 +112,10 @@ struct ThumbCacheEntry {
 static std::unordered_map<HWND, ThumbCacheEntry> g_thumbCache;
 static std::unordered_map<HWND, std::string> g_iconCache;
 static const ULONGLONG THUMB_TTL_MS = 800; // Cache thumbnails for ~0.8s
+static std::mutex g_cacheMutex; // Protects g_thumbCache and g_iconCache
+
+// Registered windows mapping and id counter (shared with async workers)
+static std::mutex g_stateMutex; // Protects registeredWindows and nextWindowId
 
 // Minimal IVirtualDesktopManager Definition, um Header-Abhängigkeiten zu vermeiden
 // {AA509086-5CA9-4C25-8F95-589D3C07B48A}
@@ -427,8 +432,11 @@ std::string IconToBase64(HICON hIcon, int size) {
 
 // Icon für ein Fenster abrufen (mit Cache)
 std::string GetWindowIconBase64(HWND hwnd, const std::string& exePath, int size = 32) {
-    auto it = g_iconCache.find(hwnd);
-    if (it != g_iconCache.end()) return it->second;
+    {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        auto it = g_iconCache.find(hwnd);
+        if (it != g_iconCache.end()) return it->second;
+    }
 
     HICON hIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL2, 0);
     if (!hIcon) hIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL, 0);
@@ -445,7 +453,10 @@ std::string GetWindowIconBase64(HWND hwnd, const std::string& exePath, int size 
 
     std::string b64 = IconToBase64(hIcon, size);
     if (extracted) DestroyIcon(extracted);
-    g_iconCache[hwnd] = b64;
+    {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        g_iconCache[hwnd] = b64;
+    }
     return b64;
 }
 
@@ -693,18 +704,24 @@ std::string GetOrCaptureWindowThumbnail(HWND hwnd, int maxWidth = 200, int maxHe
     return "data:image/png;base64,";
     }
     ULONGLONG now = GetTickCount64();
-    auto it = g_thumbCache.find(hwnd);
-    if (it != g_thumbCache.end()) {
-        const ThumbCacheEntry& e = it->second;
-        if (e.w == maxWidth && e.h == maxHeight &&
-            e.rect.left == rect.left && e.rect.top == rect.top &&
-            e.rect.right == rect.right && e.rect.bottom == rect.bottom &&
-            (now - e.ts) < THUMB_TTL_MS) {
-            return e.base64;
+    {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        auto it = g_thumbCache.find(hwnd);
+        if (it != g_thumbCache.end()) {
+            const ThumbCacheEntry& e = it->second;
+            if (e.w == maxWidth && e.h == maxHeight &&
+                e.rect.left == rect.left && e.rect.top == rect.top &&
+                e.rect.right == rect.right && e.rect.bottom == rect.bottom &&
+                (now - e.ts) < THUMB_TTL_MS) {
+                return e.base64;
+            }
         }
     }
     std::string fresh = CaptureWindowScreenshot(hwnd, maxWidth, maxHeight);
-    g_thumbCache[hwnd] = ThumbCacheEntry{ fresh, rect, now, maxWidth, maxHeight };
+    {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        g_thumbCache[hwnd] = ThumbCacheEntry{ fresh, rect, now, maxWidth, maxHeight };
+    }
     return fresh;
 }
 
@@ -892,9 +909,12 @@ Value GetWindows(const CallbackInfo& info) {
     
     for (size_t i = 0; i < windows.size(); i++) {
         const WindowInfo& window = windows[i];
-        
-        uint64_t windowId = nextWindowId++;
-        registeredWindows[windowId] = window;
+        uint64_t windowId = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            windowId = nextWindowId++;
+            registeredWindows[windowId] = window;
+        }
         
         Object windowObj = Object::New(env);
         windowObj.Set("id", Number::New(env, windowId));
@@ -926,18 +946,28 @@ Value UpdateThumbnail(const CallbackInfo& info) {
     
     uint64_t windowId = info[0].As<Number>().Int64Value();
     
-    auto it = registeredWindows.find(windowId);
-    if (it == registeredWindows.end()) {
+    HWND hwnd = NULL;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        auto it = registeredWindows.find(windowId);
+        if (it == registeredWindows.end()) {
+            Error::New(env, "Window ID not found").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+        hwnd = it->second.hwnd;
+    }
+    if (!hwnd) {
         Error::New(env, "Window ID not found").ThrowAsJavaScriptException();
         return env.Null();
     }
-    
+
     // Neuen Screenshot erstellen
-    std::string newThumbnail = CaptureWindowScreenshot(it->second.hwnd);
+    std::string newThumbnail = CaptureWindowScreenshot(hwnd);
     // Cache aktualisieren
     RECT rect;
-    if (GetWindowRect(it->second.hwnd, &rect)) {
-        g_thumbCache[it->second.hwnd] = ThumbCacheEntry{ newThumbnail, rect, GetTickCount64(), 200, 150 };
+    if (GetWindowRect(hwnd, &rect)) {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        g_thumbCache[hwnd] = ThumbCacheEntry{ newThumbnail, rect, GetTickCount64(), 200, 150 };
     }
     
     return String::New(env, newThumbnail);
@@ -954,13 +984,20 @@ Value OpenWindow(const CallbackInfo& info) {
     
     uint64_t windowId = info[0].As<Number>().Int64Value();
     
-    auto it = registeredWindows.find(windowId);
-    if (it == registeredWindows.end()) {
+    HWND hwnd = NULL;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        auto it = registeredWindows.find(windowId);
+        if (it == registeredWindows.end()) {
+            Error::New(env, "Window ID not found").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+        hwnd = it->second.hwnd;
+    }
+    if (!hwnd) {
         Error::New(env, "Window ID not found").ThrowAsJavaScriptException();
         return env.Null();
     }
-    
-    HWND hwnd = it->second.hwnd;
     
     if (!IsWindow(hwnd)) {
         Error::New(env, "Window no longer exists").ThrowAsJavaScriptException();
@@ -978,6 +1015,205 @@ Value OpenWindow(const CallbackInfo& info) {
     SetActiveWindow(hwnd);
     
     return Boolean::New(env, true);
+}
+
+// ---------------------- Async Promise-based APIs ----------------------
+class PromiseWorker : public AsyncWorker {
+public:
+    explicit PromiseWorker(Napi::Env env) : AsyncWorker(env), deferred(Napi::Promise::Deferred::New(env)) {}
+    Napi::Promise GetPromise() { return deferred.Promise(); }
+protected:
+    Napi::Promise::Deferred deferred;
+    void OnError(const Napi::Error& e) override { deferred.Reject(e.Value()); }
+};
+
+struct WindowResultEntry {
+    HWND hwnd{};
+    std::string title;
+    std::string executablePath;
+    bool isVisible{};
+    std::string thumbnail;
+    std::string icon;
+};
+
+class GetWindowsAsyncWorker : public PromiseWorker {
+public:
+    GetWindowsAsyncWorker(Napi::Env env, bool includeAll)
+        : PromiseWorker(env), includeAllDesktops(includeAll) {}
+
+    void Execute() override {
+        // Similar to GetWindows but performed on worker thread
+        // COM init for this thread
+        bool comInitialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+        IUnknown* vdmUnknown = nullptr;
+        if (comInitialized) {
+            IVirtualDesktopManager* vdm = nullptr;
+            HRESULT hr = CoCreateInstance(CLSID_VirtualDesktopManager, nullptr, CLSCTX_ALL,
+                                          IID_IVirtualDesktopManager, (void**)&vdm);
+            if (SUCCEEDED(hr) && vdm) {
+                vdmUnknown = vdm;
+            }
+        }
+
+        std::vector<WindowInfo> windows;
+        EnumContext ctx{ &windows, vdmUnknown, includeAllDesktops };
+        EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&ctx));
+
+        if (vdmUnknown) vdmUnknown->Release();
+        if (comInitialized) CoUninitialize();
+
+        // Build results and capture icon/thumbnail (may be expensive)
+        for (const auto& w : windows) {
+            WindowResultEntry e;
+            e.hwnd = w.hwnd;
+            e.title = w.title;
+            e.executablePath = w.executablePath;
+            e.isVisible = w.isVisible;
+            e.icon = GetWindowIconBase64(w.hwnd, w.executablePath);
+            e.thumbnail = GetOrCaptureWindowThumbnail(w.hwnd);
+            results.push_back(std::move(e));
+        }
+    }
+
+    void OnOK() override {
+        Napi::Env env = this->Env();
+        Array arr = Array::New(env, results.size());
+        for (size_t i = 0; i < results.size(); ++i) {
+            uint64_t id = 0;
+            // Register window id on main thread for safety
+            {
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                id = nextWindowId++;
+                registeredWindows[id] = WindowInfo{ results[i].hwnd, results[i].title, results[i].executablePath, results[i].isVisible };
+            }
+            Object o = Object::New(env);
+            o.Set("id", Number::New(env, id));
+            o.Set("title", String::New(env, results[i].title));
+            o.Set("executablePath", String::New(env, results[i].executablePath));
+            o.Set("isVisible", Boolean::New(env, results[i].isVisible));
+            o.Set("hwnd", Number::New(env, (uintptr_t)results[i].hwnd));
+            o.Set("thumbnail", String::New(env, results[i].thumbnail));
+            o.Set("icon", String::New(env, results[i].icon));
+            arr.Set(i, o);
+        }
+        deferred.Resolve(arr);
+    }
+
+private:
+    bool includeAllDesktops;
+    std::vector<WindowResultEntry> results;
+};
+
+class UpdateThumbnailAsyncWorker : public PromiseWorker {
+public:
+    UpdateThumbnailAsyncWorker(Napi::Env env, uint64_t id)
+        : PromiseWorker(env), windowId(id) {}
+
+    void Execute() override {
+        // Copy HWND under lock
+        HWND hwndLocal = NULL;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto it = registeredWindows.find(windowId);
+            if (it != registeredWindows.end()) hwndLocal = it->second.hwnd;
+        }
+        if (!hwndLocal || !IsWindow(hwndLocal)) {
+            SetError("Window ID not found or invalid");
+            return;
+        }
+        // Capture thumbnail
+        thumbnail = CaptureWindowScreenshot(hwndLocal);
+        // Update cache meta
+        RECT rect;
+        if (GetWindowRect(hwndLocal, &rect)) {
+            std::lock_guard<std::mutex> lock(g_cacheMutex);
+            g_thumbCache[hwndLocal] = ThumbCacheEntry{ thumbnail, rect, GetTickCount64(), 200, 150 };
+        }
+    }
+
+    void OnOK() override {
+        deferred.Resolve(String::New(this->Env(), thumbnail));
+    }
+
+private:
+    uint64_t windowId;
+    std::string thumbnail;
+};
+
+class OpenWindowAsyncWorker : public PromiseWorker {
+public:
+    OpenWindowAsyncWorker(Napi::Env env, uint64_t id)
+        : PromiseWorker(env), windowId(id) {}
+
+    void Execute() override {
+        HWND hwndLocal = NULL;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto it = registeredWindows.find(windowId);
+            if (it != registeredWindows.end()) hwndLocal = it->second.hwnd;
+        }
+        if (!hwndLocal || !IsWindow(hwndLocal)) {
+            SetError("Window ID not found or invalid");
+            return;
+        }
+        if (IsIconic(hwndLocal)) {
+            ShowWindow(hwndLocal, SW_RESTORE);
+        }
+        SetForegroundWindow(hwndLocal);
+        BringWindowToTop(hwndLocal);
+        SetActiveWindow(hwndLocal);
+        success = true;
+    }
+
+    void OnOK() override { deferred.Resolve(Boolean::New(this->Env(), success)); }
+
+private:
+    uint64_t windowId;
+    bool success{false};
+};
+
+Value GetWindowsAsync(const CallbackInfo& info) {
+    Env env = info.Env();
+    bool includeAllDesktops = false;
+    if (info.Length() >= 1) {
+        if (info[0].IsBoolean()) includeAllDesktops = info[0].As<Boolean>().Value();
+        else if (info[0].IsObject()) {
+            Object opts = info[0].As<Object>();
+            if (opts.Has("includeAllDesktops") && opts.Get("includeAllDesktops").IsBoolean()) {
+                includeAllDesktops = opts.Get("includeAllDesktops").As<Boolean>().Value();
+            }
+        }
+    }
+    auto* worker = new GetWindowsAsyncWorker(env, includeAllDesktops);
+    Promise promise = worker->GetPromise();
+    worker->Queue();
+    return promise;
+}
+
+Value UpdateThumbnailAsync(const CallbackInfo& info) {
+    Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        TypeError::New(env, "Expected window ID").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    uint64_t id = info[0].As<Number>().Int64Value();
+    auto* worker = new UpdateThumbnailAsyncWorker(env, id);
+    Promise promise = worker->GetPromise();
+    worker->Queue();
+    return promise;
+}
+
+Value OpenWindowAsync(const CallbackInfo& info) {
+    Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        TypeError::New(env, "Expected window ID").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    uint64_t id = info[0].As<Number>().Int64Value();
+    auto* worker = new OpenWindowAsyncWorker(env, id);
+    Promise promise = worker->GetPromise();
+    worker->Queue();
+    return promise;
 }
 
 Object Init(Env env, Object exports) {
@@ -1000,6 +1236,10 @@ Object Init(Env env, Object exports) {
     exports.Set("getWindows", Function::New(env, GetWindows));
     exports.Set("updateThumbnail", Function::New(env, UpdateThumbnail));
     exports.Set("openWindow", Function::New(env, OpenWindow));
+    // Async variants (Promise-based)
+    exports.Set("getWindowsAsync", Function::New(env, GetWindowsAsync));
+    exports.Set("updateThumbnailAsync", Function::New(env, UpdateThumbnailAsync));
+    exports.Set("openWindowAsync", Function::New(env, OpenWindowAsync));
     return exports;
 }
 

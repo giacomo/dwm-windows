@@ -14,6 +14,9 @@ export interface DwmWindows {
    * @returns Array of window information including base64-encoded thumbnails
    */
   getWindows(): WindowInfo[];
+  getWindows(options: { includeAllDesktops?: boolean } | boolean): WindowInfo[];
+  getWindowsAsync(): Promise<WindowInfo[]>;
+  getWindowsAsync(options: { includeAllDesktops?: boolean } | boolean): Promise<WindowInfo[]>;
 
   /**
    * Update thumbnail for a specific window
@@ -21,6 +24,7 @@ export interface DwmWindows {
    * @returns Updated base64-encoded thumbnail
    */
   updateThumbnail(windowId: number): string;
+  updateThumbnailAsync(windowId: number): Promise<string>;
 
   /**
    * Bring a window to the foreground and focus it
@@ -28,6 +32,12 @@ export interface DwmWindows {
    * @returns True if successful
    */
   openWindow(windowId: number): boolean;
+  openWindowAsync(windowId: number): Promise<boolean>;
+
+  getVisibleWindows(options?: { includeAllDesktops?: boolean } | boolean): WindowInfo[];
+  getVisibleWindowsAsync(options?: { includeAllDesktops?: boolean } | boolean): Promise<WindowInfo[]>;
+  getWindowsAllDesktops(): WindowInfo[];
+  getWindowsAllDesktopsAsync(): Promise<WindowInfo[]>;
 }
 
 declare const dwmWindows: DwmWindows;

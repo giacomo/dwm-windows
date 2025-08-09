@@ -49,3 +49,21 @@ const thumbSizes = current.map(w => dataUrlBytes(w.thumbnail));
 console.log(`\nPNG sizes on current desktop:`);
 console.log(`- Icons: total ${fmtKB(sum(iconSizes))}, avg ${fmtKB(sum(iconSizes)/Math.max(1,current.length))}`);
 console.log(`- Thumbnails: total ${fmtKB(sum(thumbSizes))}, avg ${fmtKB(sum(thumbSizes)/Math.max(1,current.length))}`);
+
+// --- Async API demo (non-blocking) ---
+(async () => {
+	console.log('\n[Async] Fetching visible windows...');
+	const asyncVisible = await dwmWindows.getVisibleWindowsAsync();
+	console.log(`[Async] Visible windows: ${asyncVisible.length}`);
+	if (asyncVisible[0]) {
+		const first = asyncVisible[0];
+		console.log(`[Async] Opening first window: ${first.title}`);
+		const ok = await dwmWindows.openWindowAsync(first.id);
+		console.log(`[Async] openWindowAsync ok: ${ok}`);
+		const thumb = await dwmWindows.updateThumbnailAsync(first.id);
+		console.log(`[Async] New thumbnail size: ${fmtKB(dataUrlBytes(thumb))}`);
+	}
+
+	const asyncAll = await dwmWindows.getWindowsAsync({ includeAllDesktops: true });
+	console.log(`[Async] All desktops windows: ${asyncAll.length}`);
+})();

@@ -38,6 +38,20 @@ export class DwmWindows {
   }
 
   /**
+   * Async: Get all windows with their thumbnails without blocking the event loop
+   */
+  public async getWindowsAsync(options?: { includeAllDesktops?: boolean } | boolean): Promise<WindowInfo[]> {
+    try {
+      if (options === undefined) return await nativeModule.getWindowsAsync();
+      if (typeof options === 'boolean') return await nativeModule.getWindowsAsync(options);
+      return await nativeModule.getWindowsAsync({ includeAllDesktops: !!options.includeAllDesktops });
+    } catch (error) {
+      console.error('Error getting windows (async):', error);
+      return [];
+    }
+  }
+
+  /**
    * Update thumbnail for a specific window
    * @param windowId The window ID to update
    * @returns Updated base64-encoded thumbnail
@@ -52,6 +66,18 @@ export class DwmWindows {
   }
 
   /**
+   * Async: Update thumbnail for a specific window without blocking
+   */
+  public async updateThumbnailAsync(windowId: number): Promise<string> {
+    try {
+      return await nativeModule.updateThumbnailAsync(windowId);
+    } catch (error) {
+      console.error('Error updating thumbnail (async):', error);
+      return 'data:image/png;base64,';
+    }
+  }
+
+  /**
    * Bring a window to the foreground and focus it
    * @param windowId The window ID to open/focus
    * @returns True if successful
@@ -61,6 +87,18 @@ export class DwmWindows {
       return nativeModule.openWindow(windowId);
     } catch (error) {
       console.error('Error opening window:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Async: Bring a window to the foreground without blocking
+   */
+  public async openWindowAsync(windowId: number): Promise<boolean> {
+    try {
+      return await nativeModule.openWindowAsync(windowId);
+    } catch (error) {
+      console.error('Error opening window (async):', error);
       return false;
     }
   }
@@ -101,10 +139,25 @@ export class DwmWindows {
   }
 
   /**
+   * Async: Get only visible windows (non-blocking)
+   */
+  public async getVisibleWindowsAsync(options?: { includeAllDesktops?: boolean } | boolean): Promise<WindowInfo[]> {
+    const windows = await this.getWindowsAsync(options);
+    return windows.filter(window => window.isVisible);
+  }
+
+  /**
    * Convenience: get windows from all virtual desktops
    */
   public getWindowsAllDesktops(): WindowInfo[] {
     return this.getWindows({ includeAllDesktops: true });
+  }
+
+  /**
+   * Async convenience: get windows from all virtual desktops
+   */
+  public getWindowsAllDesktopsAsync(): Promise<WindowInfo[]> {
+    return this.getWindowsAsync({ includeAllDesktops: true });
   }
 }
 
