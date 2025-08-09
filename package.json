@@ -1,0 +1,36 @@
+{
+  "name": "dwm-windows",
+  "version": "1.0.0",
+  "description": "Windows DWM thumbnail generator for Node.js/Electron",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "node-gyp rebuild && tsc",
+    "rebuild": "node-gyp rebuild",
+    "postinstall": "node-gyp rebuild",
+    "clean": "node-gyp clean && rimraf dist",
+    "dev": "tsc --watch",
+    "example": "tsc && node dist/example.js",
+    "test": "tsc && node -e \"console.log('Testing module...'); import('./dist/index.js').then(m => { const windows = m.default.getWindows(); console.log('Found', windows.length, 'windows'); })\"",
+    "gyp-rebuild": "node-gyp clean && node-gyp configure && node-gyp build"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "rimraf": "^5.0.0",
+    "typescript": "^5.0.0",
+    "prebuild": "^13.0.0",
+    "prebuild-install": "^7.1.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "os": [
+    "win32"
+  ],
+  "gypfile": true,
+  "license": "MIT"
+}
