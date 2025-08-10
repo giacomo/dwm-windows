@@ -132,6 +132,19 @@ static void WinrtCleanup(void* /*arg*/) {
         g_winrtInited = false;
     }
 }
+// Runtime gate: use WGC only when explicitly requested via env var
+static bool ShouldUseWgc() {
+    static int cached = -1; // -1 = unknown, 0 = false, 1 = true
+    if (cached != -1) return cached == 1;
+    wchar_t buf[16] = {0};
+    DWORD got = GetEnvironmentVariableW(L"DWM_WINDOWS_USE_WGC", buf, (DWORD)(sizeof(buf)/sizeof(buf[0])));
+    if (got == 0) { cached = 0; return false; }
+    // Accept 1/true/TRUE/True
+    std::wstring val(buf);
+    for (auto& c : val) c = (wchar_t)towupper(c);
+    cached = (val == L"1" || val == L"TRUE") ? 1 : 0;
+    return cached == 1;
+}
 #endif
 
 // Caches
@@ -144,7 +157,7 @@ struct ThumbCacheEntry {
 };
 static std::unordered_map<HWND, ThumbCacheEntry> g_thumbCache;
 static std::unordered_map<HWND, std::string> g_iconCache;
-static const ULONGLONG THUMB_TTL_MS = 800; // Cache thumbnails for ~0.8s
+static const ULONGLONG THUMB_TTL_MS = 1200; // Cache thumbnails for ~1.2s to reduce recomposition bursts
 static std::mutex g_cacheMutex; // Protects g_thumbCache and g_iconCache
 
 // ---------------- Window Event Hooks (Create/Destroy/Focus) ----------------
@@ -1271,8 +1284,10 @@ static std::string CaptureWithDwmThumbnail(HWND srcHwnd, int maxWidth, int maxHe
     int outW = std::max(1, (int)std::round(srcSize.cx * s));
     int outH = std::max(1, (int)std::round(srcSize.cy * s));
     RECT destRect{ 0, 0, outW, outH };
-    // Ensure window size matches destination and place on-screen at (0,0) without activating
-    SetWindowPos(dest, HWND_BOTTOM, 0, 0, outW, outH, SWP_NOACTIVATE);
+    // Ensure window size matches destination and place far off-screen to avoid any visible flicker
+    // Use an extreme negative position which remains outside all monitors' bounds.
+    SetWindowPos(dest, HWND_BOTTOM, -32768, -32768, outW, outH,
+        SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOOWNERZORDER);
 
     DWM_THUMBNAIL_PROPERTIES props{};
     props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION | DWM_TNP_SOURCECLIENTAREAONLY;
@@ -1284,8 +1299,8 @@ static std::string CaptureWithDwmThumbnail(HWND srcHwnd, int maxWidth, int maxHe
     ShowWindow(dest, SW_SHOWNOACTIVATE);
     UpdateWindow(dest);
     DwmFlush();
-    // Allow DWM to compose; slightly longer delay for minimized sources
-    Sleep(50);
+    // Allow DWM to compose; keep it short since the window is off-screen
+    Sleep(10);
 
     // Capture the composed thumbnail from the dest window
     HDC hdcWindow = GetDC(dest);
@@ -1294,7 +1309,7 @@ static std::string CaptureWithDwmThumbnail(HWND srcHwnd, int maxWidth, int maxHe
     std::string result = "data:image/png;base64,";
     if (hdcWindow && hdcMem && hbm) {
         HGDIOBJ old = SelectObject(hdcMem, hbm);
-    BitBlt(hdcMem, 0, 0, outW, outH, hdcWindow, 0, 0, SRCCOPY);
+    BitBlt(hdcMem, 0, 0, outW, outH, hdcWindow, 0, 0, SRCCOPY | CAPTUREBLT);
         SelectObject(hdcMem, old);
         result = BitmapToPngBase64(hbm, outW, outH);
     }
@@ -1472,8 +1487,9 @@ std::string CaptureWindowScreenshotWGC(HWND hwnd, int maxWidth = 200, int maxHei
     // Frame pool and session
     WGC::Direct3D11CaptureFramePool pool = WGC::Direct3D11CaptureFramePool::Create(winrtDevice, WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, sz);
     WGC::GraphicsCaptureSession session = pool.CreateCaptureSession(item);
-    // Optional: Hide capture border if available
+    // Optional: Hide capture border and cursor if available
     try { session.IsBorderRequired(false); } catch (...) {}
+    try { session.IsCursorCaptureEnabled(false); } catch (...) {}
     session.StartCapture();
 
     WGC::Direct3D11CaptureFrame frame{ nullptr };
@@ -1564,7 +1580,7 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
 
     // Preferred path for non-minimized windows (optional): Windows Graphics Capture
 #ifdef ENABLE_WGC
-    if (!IsIconic(hwnd)) {
+    if (!IsIconic(hwnd) && ShouldUseWgc()) {
         std::string wgc = CaptureWindowScreenshotWGC(hwnd, maxWidth, maxHeight);
         if (wgc.size() > strlen("data:image/png;base64,")) {
             return wgc;
@@ -1655,7 +1671,7 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
         HDC hdcDesktop = GetDC(NULL);
         if (hdcDesktop) {
             BitBlt(hdcMemDC, 0, 0, windowWidth, windowHeight, 
-                   hdcDesktop, windowRect.left, windowRect.top, SRCCOPY);
+                   hdcDesktop, windowRect.left, windowRect.top, SRCCOPY | CAPTUREBLT);
             ReleaseDC(NULL, hdcDesktop);
         }
     }

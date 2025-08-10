@@ -4,9 +4,12 @@
 
 ## ✨ Features
 
-- 🖼️ **Live window thumbnails** - Real-time PNG previews of any window
-- 🎨 **Window icons** - Extract application icons as base64 PNG data
-- 🖥️ **Virtual desktop support** - Access windows across all virtual desktops
+## Performance and capture notes
+
+- Default capture prefers classic DWM thumbnail and PrintWindow paths to avoid the flashing yellow border and screen flicker.
+- To opt into Windows Graphics Capture (WGC) for higher fidelity on some apps, set the environment variable `DWM_WINDOWS_USE_WGC=1` before running your app. The module will hide the capture border and cursor when supported.
+- Off-screen composition is used to avoid showing the helper window. If you still observe flicker, ensure no antivirus overlays or global screen effects are active.
+
 - 📝 **TypeScript-first** - Full type definitions and IntelliSense support
 - ⚡ **Native performance** - C++ bindings for optimal speed
 - 🎯 **Window management** - Focus, filter, and control windows programmatically
