@@ -72,6 +72,7 @@ console.log(`- Thumbnails: total ${fmtKB(sum(thumbSizes))}, avg ${fmtKB(sum(thum
 	dwmWindows.onWindowFocused((e) => logEvt('focused', e));
 	dwmWindows.onWindowMinimized((e) => logEvt('minimized', e));
 	dwmWindows.onWindowRestored((e) => logEvt('restored', e));
+	dwmWindows.onWindowChange((e) => logEvt(e?.type || 'change', e));
 
 	// Keep the process alive awaiting user actions indefinitely until Ctrl+C
 	await new Promise(() => {});

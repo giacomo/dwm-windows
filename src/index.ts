@@ -204,6 +204,11 @@ export class DwmWindows {
   public isUsingFallbackEvents(): boolean {
     try { return !!nativeModule.isUsingFallbackEvents(); } catch { return false; }
   }
+
+  /** Unified window change event: created/closed/focused/minimized/restored (e.type). */
+  public onWindowChange(callback: (e: any) => void): void {
+    try { nativeModule.onWindowChange(callback); } catch (e) { console.error('onWindowChange error:', e); }
+  }
 }
 
 // Create and export default instance

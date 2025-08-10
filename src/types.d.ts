@@ -45,6 +45,7 @@ export interface DwmWindows {
   onWindowFocused(callback: (e: any) => void): void;
   onWindowMinimized(callback: (e: any) => void): void;
   onWindowRestored(callback: (e: any) => void): void;
+  onWindowChange(callback: (e: any) => void): void; // unified: e.type in {created,closed,focused,minimized,restored}
   stopWindowEvents(): void;
 
   // Diagnostics
