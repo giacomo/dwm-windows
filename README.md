@@ -81,6 +81,7 @@ Subscribe to native window events without polling:
 - `onWindowCreated(cb: (e) => void)`
 - `onWindowClosed(cb: (e) => void)`
 - `onWindowFocused(cb: (e) => void)`
+- `onWindowChange(cb: (e) => void)` // unified: e.type in {created,closed,focused,minimized,restored}
 - `stopWindowEvents()`
 
 Each event payload contains: `{ id, hwnd, title, executablePath, isVisible, type }`.
