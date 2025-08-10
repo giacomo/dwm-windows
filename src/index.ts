@@ -159,6 +159,51 @@ export class DwmWindows {
   public getWindowsAllDesktopsAsync(): Promise<WindowInfo[]> {
     return this.getWindowsAsync({ includeAllDesktops: true });
   }
+
+  /**
+   * Subscribe to window created events. Callback receives a WindowInfo-like object (id, hwnd, title, executablePath, isVisible) and type: 'created'.
+   */
+  public onWindowCreated(callback: (e: any) => void): void {
+    try { nativeModule.onWindowCreated(callback); } catch (e) { console.error('onWindowCreated error:', e); }
+  }
+
+  /**
+   * Subscribe to window closed events. Callback receives at least id/hwnd and type: 'closed'. Title/path may be empty.
+   */
+  public onWindowClosed(callback: (e: any) => void): void {
+    try { nativeModule.onWindowClosed(callback); } catch (e) { console.error('onWindowClosed error:', e); }
+  }
+
+  /**
+   * Subscribe to window focused (foreground) events.
+   */
+  public onWindowFocused(callback: (e: any) => void): void {
+    try { nativeModule.onWindowFocused(callback); } catch (e) { console.error('onWindowFocused error:', e); }
+  }
+
+  /**
+   * Subscribe to window minimized events
+   */
+  public onWindowMinimized(callback: (e: any) => void): void {
+    try { nativeModule.onWindowMinimized(callback); } catch (e) { console.error('onWindowMinimized error:', e); }
+  }
+
+  /**
+   * Subscribe to window restored (shown) events
+   */
+  public onWindowRestored(callback: (e: any) => void): void {
+    try { nativeModule.onWindowRestored(callback); } catch (e) { console.error('onWindowRestored error:', e); }
+  }
+
+  /** Stop all window event hooks and release native resources. */
+  public stopWindowEvents(): void {
+    try { nativeModule.stopWindowEvents(); } catch (e) { console.error('stopWindowEvents error:', e); }
+  }
+
+  /** For diagnostics: true if native module fell back to polling for events. */
+  public isUsingFallbackEvents(): boolean {
+    try { return !!nativeModule.isUsingFallbackEvents(); } catch { return false; }
+  }
 }
 
 // Create and export default instance

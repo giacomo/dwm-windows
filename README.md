@@ -10,6 +10,7 @@
 - 📝 **TypeScript-first** - Full type definitions and IntelliSense support
 - ⚡ **Native performance** - C++ bindings for optimal speed
 - 🎯 **Window management** - Focus, filter, and control windows programmatically
+- 🔔 **Event hooks (no polling)** - Created/closed/focused callbacks via native WinEvent hooks
 
 ## 📦 Installation
 
@@ -71,6 +72,29 @@ if (all.length) {
   const freshThumb = await dwmWindows.updateThumbnailAsync(all[0].id);
   console.log('Thumb length:', freshThumb.length);
 }
+```
+
+### Event Hooks (no polling)
+
+Subscribe to native window events without polling:
+
+- `onWindowCreated(cb: (e) => void)`
+- `onWindowClosed(cb: (e) => void)`
+- `onWindowFocused(cb: (e) => void)`
+- `stopWindowEvents()`
+
+Each event payload contains: `{ id, hwnd, title, executablePath, isVisible, type }`.
+For `closed`, `title`/`executablePath` may be empty because the window is already gone.
+
+```ts
+import dwmWindows from 'dwm-windows';
+
+dwmWindows.onWindowCreated(e => console.log('Created:', e));
+dwmWindows.onWindowClosed(e => console.log('Closed:', e));
+dwmWindows.onWindowFocused(e => console.log('Focused:', e));
+
+// Later, to clean up
+dwmWindows.stopWindowEvents();
 ```
 
 ### Filter Methods
@@ -150,6 +174,29 @@ console.log(`Total payload: ${totalIconSize + totalThumbSize}KB`);
 console.log(`Icons: ${totalIconSize}KB, Thumbnails: ${totalThumbSize}KB`);
 ```
 
+### Live Updates with Events
+
+```ts
+import dwmWindows from 'dwm-windows';
+
+const windows = new Map<number, { title: string }>();
+dwmWindows.getVisibleWindows().forEach(w => windows.set(w.id, { title: w.title }));
+
+dwmWindows.onWindowCreated(e => {
+  windows.set(e.id, { title: e.title });
+  console.log('Added', e.id, e.title);
+});
+
+dwmWindows.onWindowClosed(e => {
+  windows.delete(e.id);
+  console.log('Removed', e.id);
+});
+
+dwmWindows.onWindowFocused(e => {
+  console.log('Focused', e.id, e.title);
+});
+```
+
 ## 🏗️ Development
 
 ### Prerequisites
@@ -174,6 +221,10 @@ yarn build
 # Run example
 yarn example
 ```
+
+Notes:
+- Windows Graphics Capture is enabled by default for robust, flicker-free captures when supported.
+- Minimized windows use DWM previews; if only a tiny title bar is available, a placeholder thumbnail (centered app icon) is shown instead of a low-quality image.
 
 ### Project Structure
 

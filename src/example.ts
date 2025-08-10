@@ -55,15 +55,24 @@ console.log(`- Thumbnails: total ${fmtKB(sum(thumbSizes))}, avg ${fmtKB(sum(thum
 	console.log('\n[Async] Fetching visible windows...');
 	const asyncVisible = await dwmWindows.getVisibleWindowsAsync();
 	console.log(`[Async] Visible windows: ${asyncVisible.length}`);
-	if (asyncVisible[0]) {
-		const first = asyncVisible[0];
-		console.log(`[Async] Opening first window: ${first.title}`);
-		const ok = await dwmWindows.openWindowAsync(first.id);
-		console.log(`[Async] openWindowAsync ok: ${ok}`);
-		const thumb = await dwmWindows.updateThumbnailAsync(first.id);
-		console.log(`[Async] New thumbnail size: ${fmtKB(dataUrlBytes(thumb))}`);
-	}
-
 	const asyncAll = await dwmWindows.getWindowsAsync({ includeAllDesktops: true });
 	console.log(`[Async] All desktops windows: ${asyncAll.length}`);
+
+	// --- Event hooks demo (no polling) ---
+	console.log('\n[Events] Subscribing to window events. Click around, minimize/restore WhatsApp and other apps to see logs. Press Ctrl+C to exit.');
+	console.log(`[Events] Fallback poller active: ${dwmWindows.isUsingFallbackEvents?.()}`);
+	const logEvt = (tag: string, e: any) => {
+		const title = e?.title || '';
+		const path = e?.executablePath || '';
+		console.log(`[${tag}] id=${e?.id} hwnd=${e?.hwnd} "${title}" (${path})`);
+	};
+
+	dwmWindows.onWindowCreated((e) => logEvt('created', e));
+	dwmWindows.onWindowClosed((e) => logEvt('closed', e));
+	dwmWindows.onWindowFocused((e) => logEvt('focused', e));
+	dwmWindows.onWindowMinimized((e) => logEvt('minimized', e));
+	dwmWindows.onWindowRestored((e) => logEvt('restored', e));
+
+	// Keep the process alive awaiting user actions indefinitely until Ctrl+C
+	await new Promise(() => {});
 })();

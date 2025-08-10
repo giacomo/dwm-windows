@@ -38,6 +38,17 @@ export interface DwmWindows {
   getVisibleWindowsAsync(options?: { includeAllDesktops?: boolean } | boolean): Promise<WindowInfo[]>;
   getWindowsAllDesktops(): WindowInfo[];
   getWindowsAllDesktopsAsync(): Promise<WindowInfo[]>;
+
+  // Event hooks (no polling)
+  onWindowCreated(callback: (e: any) => void): void;
+  onWindowClosed(callback: (e: any) => void): void;
+  onWindowFocused(callback: (e: any) => void): void;
+  onWindowMinimized(callback: (e: any) => void): void;
+  onWindowRestored(callback: (e: any) => void): void;
+  stopWindowEvents(): void;
+
+  // Diagnostics
+  isUsingFallbackEvents(): boolean;
 }
 
 declare const dwmWindows: DwmWindows;

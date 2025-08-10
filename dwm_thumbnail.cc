@@ -46,6 +46,7 @@
 #include <iomanip>
 #include <unordered_map>
 #include <mutex>
+#include <functional>
 
 // PrintWindow Flags definieren falls nicht verfügbar
 #ifndef PW_RENDERFULLCONTENT
@@ -54,6 +55,14 @@
 
 #ifndef PW_CLIENTONLY
 #define PW_CLIENTONLY 0x00000001
+#endif
+
+// WinEvent constants for cloaking were introduced in newer SDKs; define if missing
+#ifndef EVENT_OBJECT_CLOAKED
+#define EVENT_OBJECT_CLOAKED 0x8017
+#endif
+#ifndef EVENT_OBJECT_UNCLOAKED
+#define EVENT_OBJECT_UNCLOAKED 0x8018
 #endif
 
 #pragma comment(lib, "dwmapi.lib")
@@ -72,6 +81,9 @@
 using namespace Napi;
 
 // ---------------- UTF-8 / UTF-16 helpers ----------------
+// Forward declarations for helpers used by event hooks
+static std::string GetWindowTitle(HWND hwnd);
+static std::string GetExecutablePath(HWND hwnd);
 static std::string WideToUtf8(const std::wstring& w) {
     if (w.empty()) return std::string();
     int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -134,6 +146,493 @@ static std::unordered_map<HWND, ThumbCacheEntry> g_thumbCache;
 static std::unordered_map<HWND, std::string> g_iconCache;
 static const ULONGLONG THUMB_TTL_MS = 800; // Cache thumbnails for ~0.8s
 static std::mutex g_cacheMutex; // Protects g_thumbCache and g_iconCache
+
+// ---------------- Window Event Hooks (Create/Destroy/Focus) ----------------
+static HWINEVENTHOOK g_hookCreate = nullptr;
+static HWINEVENTHOOK g_hookDestroy = nullptr;
+static HWINEVENTHOOK g_hookForeground = nullptr;
+static HWINEVENTHOOK g_hookShow = nullptr;
+static HWINEVENTHOOK g_hookHide = nullptr;
+static HWINEVENTHOOK g_hookCloaked = nullptr;     // EVENT_OBJECT_CLOAKED
+static HWINEVENTHOOK g_hookUncloaked = nullptr;   // EVENT_OBJECT_UNCLOAKED
+static HWINEVENTHOOK g_hookMinStart = nullptr;    // EVENT_SYSTEM_MINIMIZESTART
+static HWINEVENTHOOK g_hookMinEnd = nullptr;      // EVENT_SYSTEM_MINIMIZEEND
+static HWINEVENTHOOK g_hookState = nullptr;       // EVENT_OBJECT_STATECHANGE
+
+struct WindowEventPayload {
+    HWND hwnd{};
+    std::string title;
+    std::string exePath;
+    bool isVisible{};
+};
+
+static ThreadSafeFunction g_tsfnCreated;
+static ThreadSafeFunction g_tsfnClosed;
+static ThreadSafeFunction g_tsfnFocused;
+static ThreadSafeFunction g_tsfnMinimized;
+static ThreadSafeFunction g_tsfnRestored;
+
+// Fallback poller when WinEvent hooks are unavailable in some environments
+#include <thread>
+#include <atomic>
+#include <unordered_set>
+static std::thread g_eventPollerThread;
+static std::atomic<bool> g_eventPollerRunning{ false };
+static std::atomic<bool> g_usingFallbackEvents{ false };
+static std::atomic<ULONGLONG> g_lastHookEventTick{ 0 };
+
+static void StartFallbackEventPoller();
+static void StopFallbackEventPoller();
+
+static bool IsTopLevelWindow(HWND hwnd) {
+    if (!hwnd) return false;
+    return GetAncestor(hwnd, GA_ROOT) == hwnd;
+}
+
+static WindowEventPayload MakePayload(HWND hwnd) {
+    WindowEventPayload p{};
+    p.hwnd = hwnd;
+    p.title = GetWindowTitle(hwnd);
+    p.exePath = GetExecutablePath(hwnd);
+    p.isVisible = IsWindowVisible(hwnd) ? true : false;
+    return p;
+}
+
+static void CALLBACK WinEventProcCB(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+    g_lastHookEventTick.store(GetTickCount64());
+    // Filter only window object events or foreground changes
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        if (!IsWindow(hwnd)) return;
+        // Map to top-level root to normalize hosted/UWP cases
+        HWND top = GetAncestor(hwnd, GA_ROOT);
+        if (top) hwnd = top;
+        if (g_tsfnFocused) {
+            WindowEventPayload payload = MakePayload(hwnd);
+            auto* heap = new WindowEventPayload(std::move(payload));
+            napi_status s = g_tsfnFocused.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                Object o = Object::New(env);
+                o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("title", String::New(env, data->title));
+                o.Set("executablePath", String::New(env, data->exePath));
+                o.Set("isVisible", Boolean::New(env, data->isVisible));
+                o.Set("type", String::New(env, "focused"));
+                cb.Call({ o });
+                delete data;
+            });
+            (void)s;
+        }
+        return;
+    }
+    // Handle UWP-style minimize/restore via cloaking
+    if (event == EVENT_OBJECT_CLOAKED) {
+        if (idObject != OBJID_WINDOW) return;
+        // Map child to top-level window to ensure hosted/UWP apps surface events
+        HWND top = hwnd ? GetAncestor(hwnd, GA_ROOT) : NULL;
+        if (top) hwnd = top;
+        if (!IsWindow(hwnd) || !IsTopLevelWindow(hwnd)) return;
+        if (g_tsfnMinimized) {
+            WindowEventPayload payload = MakePayload(hwnd);
+            auto* heap = new WindowEventPayload(std::move(payload));
+            g_tsfnMinimized.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                Object o = Object::New(env);
+                o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("title", String::New(env, data->title));
+                o.Set("executablePath", String::New(env, data->exePath));
+                o.Set("isVisible", Boolean::New(env, data->isVisible));
+                o.Set("type", String::New(env, "minimized"));
+                cb.Call({ o });
+                delete data;
+            });
+        }
+        return;
+    }
+    // Fallback: state changes can indicate minimized/restored transitions
+    if (event == EVENT_OBJECT_STATECHANGE) {
+        if (idObject != OBJID_WINDOW && idObject != OBJID_CLIENT) return;
+        if (!IsWindow(hwnd)) return;
+        HWND top = GetAncestor(hwnd, GA_ROOT);
+        if (top) hwnd = top;
+        if (!IsWindow(hwnd) || !IsTopLevelWindow(hwnd)) return;
+        if (IsIconic(hwnd)) {
+            if (g_tsfnMinimized) {
+                auto* heap = new WindowEventPayload(MakePayload(hwnd));
+                g_tsfnMinimized.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                    Object o = Object::New(env);
+                    o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                    o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                    o.Set("title", String::New(env, data->title));
+                    o.Set("executablePath", String::New(env, data->exePath));
+                    o.Set("isVisible", Boolean::New(env, data->isVisible));
+                    o.Set("type", String::New(env, "minimized"));
+                    cb.Call({ o });
+                    delete data;
+                });
+            }
+        } else {
+            if (g_tsfnRestored && IsWindowVisible(hwnd)) {
+                auto* heap = new WindowEventPayload(MakePayload(hwnd));
+                g_tsfnRestored.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                    Object o = Object::New(env);
+                    o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                    o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                    o.Set("title", String::New(env, data->title));
+                    o.Set("executablePath", String::New(env, data->exePath));
+                    o.Set("isVisible", Boolean::New(env, data->isVisible));
+                    o.Set("type", String::New(env, "restored"));
+                    cb.Call({ o });
+                    delete data;
+                });
+            }
+        }
+        // don't return; allow further specific handlers if they apply
+    }
+    if (event == EVENT_OBJECT_UNCLOAKED) {
+        if (idObject != OBJID_WINDOW) return;
+        HWND top = hwnd ? GetAncestor(hwnd, GA_ROOT) : NULL;
+        if (top) hwnd = top;
+        if (!IsWindow(hwnd) || !IsTopLevelWindow(hwnd)) return;
+        if (g_tsfnRestored) {
+            WindowEventPayload payload = MakePayload(hwnd);
+            auto* heap = new WindowEventPayload(std::move(payload));
+            g_tsfnRestored.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                Object o = Object::New(env);
+                o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("title", String::New(env, data->title));
+                o.Set("executablePath", String::New(env, data->exePath));
+                o.Set("isVisible", Boolean::New(env, data->isVisible));
+                o.Set("type", String::New(env, "restored"));
+                cb.Call({ o });
+                delete data;
+            });
+        }
+        return;
+    }
+    // System-wide minimize start/end as hints (best-effort)
+    if (event == EVENT_SYSTEM_MINIMIZESTART) {
+        if ((!IsWindow(hwnd) || !IsTopLevelWindow(hwnd))) {
+            HWND fg = GetForegroundWindow();
+            if (fg) hwnd = GetAncestor(fg, GA_ROOT);
+        }
+        if (IsWindow(hwnd) && IsTopLevelWindow(hwnd) && g_tsfnMinimized) {
+            WindowEventPayload payload = MakePayload(hwnd);
+            auto* heap = new WindowEventPayload(std::move(payload));
+            g_tsfnMinimized.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                Object o = Object::New(env);
+                o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("title", String::New(env, data->title));
+                o.Set("executablePath", String::New(env, data->exePath));
+                o.Set("isVisible", Boolean::New(env, data->isVisible));
+                o.Set("type", String::New(env, "minimized"));
+                cb.Call({ o });
+                delete data;
+            });
+        }
+        return;
+    }
+    if (event == EVENT_SYSTEM_MINIMIZEEND) {
+        if ((!IsWindow(hwnd) || !IsTopLevelWindow(hwnd))) {
+            HWND fg = GetForegroundWindow();
+            if (fg) hwnd = GetAncestor(fg, GA_ROOT);
+        }
+        if (IsWindow(hwnd) && IsTopLevelWindow(hwnd) && g_tsfnRestored) {
+            WindowEventPayload payload = MakePayload(hwnd);
+            auto* heap = new WindowEventPayload(std::move(payload));
+            g_tsfnRestored.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                Object o = Object::New(env);
+                o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("title", String::New(env, data->title));
+                o.Set("executablePath", String::New(env, data->exePath));
+                o.Set("isVisible", Boolean::New(env, data->isVisible));
+                o.Set("type", String::New(env, "restored"));
+                cb.Call({ o });
+                delete data;
+            });
+        }
+        return;
+    }
+    // For show/hide/minimize/restore, require a real window object (accept WINDOW or CLIENT)
+    if (idObject != OBJID_WINDOW && idObject != OBJID_CLIENT) return;
+    if (!IsWindow(hwnd) || !IsTopLevelWindow(hwnd)) return;
+    if (event == EVENT_OBJECT_HIDE) {
+        HWND top = hwnd ? GetAncestor(hwnd, GA_ROOT) : NULL;
+        if (top) hwnd = top;
+        // Treat as minimized/hidden
+        if (g_tsfnMinimized) {
+            WindowEventPayload payload = MakePayload(hwnd);
+            auto* heap = new WindowEventPayload(std::move(payload));
+            napi_status s = g_tsfnMinimized.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                Object o = Object::New(env);
+                o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("title", String::New(env, data->title));
+                o.Set("executablePath", String::New(env, data->exePath));
+                o.Set("isVisible", Boolean::New(env, data->isVisible));
+                o.Set("type", String::New(env, "minimized"));
+                cb.Call({ o });
+                delete data;
+            });
+            (void)s;
+        }
+        return;
+    }
+    if (event == EVENT_OBJECT_SHOW) {
+        HWND top = hwnd ? GetAncestor(hwnd, GA_ROOT) : NULL;
+        if (top) hwnd = top;
+        // Treat as restored/shown
+        if (g_tsfnRestored) {
+            WindowEventPayload payload = MakePayload(hwnd);
+            auto* heap = new WindowEventPayload(std::move(payload));
+            napi_status s = g_tsfnRestored.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                Object o = Object::New(env);
+                o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("title", String::New(env, data->title));
+                o.Set("executablePath", String::New(env, data->exePath));
+                o.Set("isVisible", Boolean::New(env, data->isVisible));
+                o.Set("type", String::New(env, "restored"));
+                cb.Call({ o });
+                delete data;
+            });
+            (void)s;
+        }
+        // continue to also let CREATE/other handlers run if applicable
+    }
+    if (event == EVENT_OBJECT_CREATE) {
+        if (g_tsfnCreated) {
+            WindowEventPayload payload = MakePayload(hwnd);
+            auto* heap = new WindowEventPayload(std::move(payload));
+            napi_status s = g_tsfnCreated.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                Object o = Object::New(env);
+                o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("title", String::New(env, data->title));
+                o.Set("executablePath", String::New(env, data->exePath));
+                o.Set("isVisible", Boolean::New(env, data->isVisible));
+                o.Set("type", String::New(env, "created"));
+                cb.Call({ o });
+                delete data;
+            });
+            (void)s;
+        }
+    } else if (event == EVENT_OBJECT_DESTROY) {
+        if (g_tsfnClosed) {
+            // For destroyed windows, title/path may be inaccessible; send minimal info
+            auto* heap = new WindowEventPayload();
+            heap->hwnd = hwnd;
+            heap->title = std::string();
+            heap->exePath = std::string();
+            heap->isVisible = false;
+            napi_status s = g_tsfnClosed.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                Object o = Object::New(env);
+                o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                o.Set("title", String::New(env, data->title));
+                o.Set("executablePath", String::New(env, data->exePath));
+                o.Set("isVisible", Boolean::New(env, data->isVisible));
+                o.Set("type", String::New(env, "closed"));
+                cb.Call({ o });
+                delete data;
+            });
+            (void)s;
+        }
+    }
+}
+
+static void EnsureHooksInstalled() {
+    if (g_hookCreate || g_hookDestroy || g_hookForeground || g_hookShow || g_hookHide || g_hookCloaked || g_hookUncloaked || g_hookMinStart || g_hookMinEnd || g_hookState) return;
+    DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    g_hookCreate = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE, NULL, WinEventProcCB, 0, 0, flags);
+    g_hookDestroy = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, NULL, WinEventProcCB, 0, 0, flags);
+    g_hookForeground = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, WinEventProcCB, 0, 0, flags);
+    g_hookShow = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, NULL, WinEventProcCB, 0, 0, flags);
+    g_hookHide = SetWinEventHook(EVENT_OBJECT_HIDE, EVENT_OBJECT_HIDE, NULL, WinEventProcCB, 0, 0, flags);
+    // Cloak/uncloak and minimize start/end
+    g_hookCloaked = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CLOAKED, NULL, WinEventProcCB, 0, 0, flags);
+    g_hookUncloaked = SetWinEventHook(EVENT_OBJECT_UNCLOAKED, EVENT_OBJECT_UNCLOAKED, NULL, WinEventProcCB, 0, 0, flags);
+    g_hookMinStart = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART, NULL, WinEventProcCB, 0, 0, flags);
+    g_hookMinEnd = SetWinEventHook(EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZEEND, NULL, WinEventProcCB, 0, 0, flags);
+    g_hookState = SetWinEventHook(EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE, NULL, WinEventProcCB, 0, 0, flags);
+    // Always start a lightweight fallback poller; it auto-suppresses when hook events are flowing
+    StartFallbackEventPoller();
+}
+
+static void UninstallHooks() {
+    if (g_hookCreate) { UnhookWinEvent(g_hookCreate); g_hookCreate = nullptr; }
+    if (g_hookDestroy) { UnhookWinEvent(g_hookDestroy); g_hookDestroy = nullptr; }
+    if (g_hookForeground) { UnhookWinEvent(g_hookForeground); g_hookForeground = nullptr; }
+    if (g_hookShow) { UnhookWinEvent(g_hookShow); g_hookShow = nullptr; }
+    if (g_hookHide) { UnhookWinEvent(g_hookHide); g_hookHide = nullptr; }
+    if (g_hookCloaked) { UnhookWinEvent(g_hookCloaked); g_hookCloaked = nullptr; }
+    if (g_hookUncloaked) { UnhookWinEvent(g_hookUncloaked); g_hookUncloaked = nullptr; }
+    if (g_hookMinStart) { UnhookWinEvent(g_hookMinStart); g_hookMinStart = nullptr; }
+    if (g_hookMinEnd) { UnhookWinEvent(g_hookMinEnd); g_hookMinEnd = nullptr; }
+    if (g_hookState) { UnhookWinEvent(g_hookState); g_hookState = nullptr; }
+    StopFallbackEventPoller();
+}
+
+// --------------------- Fallback poller implementation ---------------------
+static void EnumTopLevelWindows(std::vector<HWND>& out) {
+    out.clear();
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        // Top-level visible and Alt-Tab eligible-ish (fast checks)
+        if (!IsWindow(hwnd) || !IsTopLevelWindow(hwnd) || !IsWindowVisible(hwnd)) return TRUE;
+        LONG exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+        if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+        if (GetWindow(hwnd, GW_OWNER)) return TRUE;
+        // Basic size check
+        RECT rc{}; if (!GetWindowRect(hwnd, &rc)) return TRUE;
+        if ((rc.right - rc.left) < 50 || (rc.bottom - rc.top) < 50) return TRUE;
+        reinterpret_cast<std::vector<HWND>*>(lParam)->push_back(hwnd);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&out));
+}
+
+static void StartFallbackEventPoller() {
+    bool expected = false;
+    if (!g_eventPollerRunning.compare_exchange_strong(expected, true)) return; // already running
+    g_usingFallbackEvents = true;
+    g_eventPollerThread = std::thread([](){
+        HWND lastFg = nullptr;
+        std::unordered_set<HWND> known;
+        std::unordered_map<HWND, bool> minimized;
+        std::vector<HWND> current;
+        while (g_eventPollerRunning.load()) {
+            // Suppress if hooks have been active recently
+            ULONGLONG nowTick = GetTickCount64();
+            ULONGLONG lastHook = g_lastHookEventTick.load();
+            bool hooksActive = (lastHook != 0 && (nowTick - lastHook) < 1000);
+
+            // Foreground change detection
+            HWND fg = GetForegroundWindow();
+            if (fg) {
+                HWND top = GetAncestor(fg, GA_ROOT);
+                if (top) fg = top;
+            }
+            if (!hooksActive && fg && fg != lastFg && g_tsfnFocused) {
+                auto* heap = new WindowEventPayload(MakePayload(fg));
+                g_tsfnFocused.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                    Object o = Object::New(env);
+                    o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                    o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                    o.Set("title", String::New(env, data->title));
+                    o.Set("executablePath", String::New(env, data->exePath));
+                    o.Set("isVisible", Boolean::New(env, data->isVisible));
+                    o.Set("type", String::New(env, "focused"));
+                    cb.Call({ o });
+                    delete data;
+                });
+            }
+            lastFg = fg;
+
+            // Window set diff for created/closed + minimized/restored state
+            EnumTopLevelWindows(current);
+            std::unordered_set<HWND> currSet(current.begin(), current.end());
+            // Created
+            if (!hooksActive && g_tsfnCreated) {
+                for (HWND h : current) {
+                    if (known.find(h) == known.end()) {
+                        known.insert(h);
+                        auto* heap = new WindowEventPayload(MakePayload(h));
+                        g_tsfnCreated.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                            Object o = Object::New(env);
+                            o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                            o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                            o.Set("title", String::New(env, data->title));
+                            o.Set("executablePath", String::New(env, data->exePath));
+                            o.Set("isVisible", Boolean::New(env, data->isVisible));
+                            o.Set("type", String::New(env, "created"));
+                            cb.Call({ o });
+                            delete data;
+                        });
+                    }
+                }
+            } else {
+                // keep known in sync even if no created callback set
+                for (HWND h : current) known.insert(h);
+            }
+            // Closed
+            if (!hooksActive && g_tsfnClosed) {
+                std::vector<HWND> toRemove;
+                for (auto h : known) if (currSet.find(h) == currSet.end()) toRemove.push_back(h);
+                for (auto h : toRemove) {
+                    known.erase(h);
+                    auto* heap = new WindowEventPayload();
+                    heap->hwnd = h; heap->title = std::string(); heap->exePath = std::string(); heap->isVisible = false;
+                    g_tsfnClosed.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                        Object o = Object::New(env);
+                        o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                        o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                        o.Set("title", String::New(env, data->title));
+                        o.Set("executablePath", String::New(env, data->exePath));
+                        o.Set("isVisible", Boolean::New(env, data->isVisible));
+                        o.Set("type", String::New(env, "closed"));
+                        cb.Call({ o });
+                        delete data;
+                    });
+                }
+            } else {
+                // purge known of disappeared
+                std::vector<HWND> toRemove;
+                for (auto h : known) if (currSet.find(h) == currSet.end()) toRemove.push_back(h);
+                for (auto h : toRemove) known.erase(h);
+            }
+
+            // Minimized/restored transitions
+        for (HWND h : current) {
+                bool nowMin = IsIconic(h) ? true : false;
+                auto it = minimized.find(h);
+                bool wasKnown = (it != minimized.end());
+                if (!wasKnown) minimized[h] = nowMin;
+                else if (it->second != nowMin) {
+                    it->second = nowMin;
+            if (!hooksActive && nowMin && g_tsfnMinimized) {
+                        auto* heap = new WindowEventPayload(MakePayload(h));
+                        g_tsfnMinimized.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                            Object o = Object::New(env);
+                            o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                            o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                            o.Set("title", String::New(env, data->title));
+                            o.Set("executablePath", String::New(env, data->exePath));
+                            o.Set("isVisible", Boolean::New(env, data->isVisible));
+                            o.Set("type", String::New(env, "minimized"));
+                            cb.Call({ o });
+                            delete data;
+                        });
+                    } else if (!hooksActive && !nowMin && g_tsfnRestored) {
+                        auto* heap = new WindowEventPayload(MakePayload(h));
+                        g_tsfnRestored.BlockingCall(heap, [](Env env, Function cb, WindowEventPayload* data){
+                            Object o = Object::New(env);
+                            o.Set("id", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                            o.Set("hwnd", Number::New(env, (uint64_t)(uintptr_t)data->hwnd));
+                            o.Set("title", String::New(env, data->title));
+                            o.Set("executablePath", String::New(env, data->exePath));
+                            o.Set("isVisible", Boolean::New(env, data->isVisible));
+                            o.Set("type", String::New(env, "restored"));
+                            cb.Call({ o });
+                            delete data;
+                        });
+                    }
+                }
+            }
+
+            Sleep(250);
+        }
+    });
+}
+
+static void StopFallbackEventPoller() {
+    if (!g_eventPollerRunning.load()) return;
+    g_eventPollerRunning.store(false);
+    if (g_eventPollerThread.joinable()) {
+        try { g_eventPollerThread.join(); } catch (...) {}
+    }
+    g_usingFallbackEvents = false;
+}
 
 // Registered windows mapping and id counter (shared with async workers)
 // No longer need a global map of IDs; id is the HWND itself
@@ -1596,6 +2095,97 @@ Object Init(Env env, Object exports) {
     exports.Set("getWindowsAsync", Function::New(env, GetWindowsAsync));
     exports.Set("updateThumbnailAsync", Function::New(env, UpdateThumbnailAsync));
     exports.Set("openWindowAsync", Function::New(env, OpenWindowAsync));
+
+    // Event registration: onWindowCreated/onWindowClosed/onWindowFocused
+    exports.Set("onWindowCreated", Function::New(env, [](const CallbackInfo& info){
+        Env e = info.Env();
+        if (info.Length() < 1 || !info[0].IsFunction()) {
+            TypeError::New(e, "Expected callback function").ThrowAsJavaScriptException();
+            return;
+        }
+        if (!g_tsfnCreated) {
+            g_tsfnCreated = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-created", 0, 1);
+        } else {
+            // Replace callback: release old and set new
+            g_tsfnCreated.Release();
+            g_tsfnCreated = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-created", 0, 1);
+        }
+        EnsureHooksInstalled();
+    }));
+
+    exports.Set("onWindowClosed", Function::New(env, [](const CallbackInfo& info){
+        Env e = info.Env();
+        if (info.Length() < 1 || !info[0].IsFunction()) {
+            TypeError::New(e, "Expected callback function").ThrowAsJavaScriptException();
+            return;
+        }
+        if (!g_tsfnClosed) {
+            g_tsfnClosed = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-closed", 0, 1);
+        } else {
+            g_tsfnClosed.Release();
+            g_tsfnClosed = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-closed", 0, 1);
+        }
+        EnsureHooksInstalled();
+    }));
+
+    exports.Set("onWindowFocused", Function::New(env, [](const CallbackInfo& info){
+        Env e = info.Env();
+        if (info.Length() < 1 || !info[0].IsFunction()) {
+            TypeError::New(e, "Expected callback function").ThrowAsJavaScriptException();
+            return;
+        }
+        if (!g_tsfnFocused) {
+            g_tsfnFocused = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-focused", 0, 1);
+        } else {
+            g_tsfnFocused.Release();
+            g_tsfnFocused = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-focused", 0, 1);
+        }
+        EnsureHooksInstalled();
+    }));
+
+    // Minimized/Restored events
+    exports.Set("onWindowMinimized", Function::New(env, [](const CallbackInfo& info){
+        Env e = info.Env();
+        if (info.Length() < 1 || !info[0].IsFunction()) {
+            TypeError::New(e, "Expected callback function").ThrowAsJavaScriptException();
+            return;
+        }
+        if (!g_tsfnMinimized) {
+            g_tsfnMinimized = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-minimized", 0, 1);
+        } else {
+            g_tsfnMinimized.Release();
+            g_tsfnMinimized = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-minimized", 0, 1);
+        }
+        EnsureHooksInstalled();
+    }));
+
+    exports.Set("onWindowRestored", Function::New(env, [](const CallbackInfo& info){
+        Env e = info.Env();
+        if (info.Length() < 1 || !info[0].IsFunction()) {
+            TypeError::New(e, "Expected callback function").ThrowAsJavaScriptException();
+            return;
+        }
+        if (!g_tsfnRestored) {
+            g_tsfnRestored = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-restored", 0, 1);
+        } else {
+            g_tsfnRestored.Release();
+            g_tsfnRestored = ThreadSafeFunction::New(e, info[0].As<Function>(), "win-restored", 0, 1);
+        }
+        EnsureHooksInstalled();
+    }));
+
+    exports.Set("stopWindowEvents", Function::New(env, [](const CallbackInfo& info){
+        (void)info;
+        UninstallHooks();
+        if (g_tsfnCreated) { g_tsfnCreated.Release(); g_tsfnCreated = ThreadSafeFunction(); }
+        if (g_tsfnClosed) { g_tsfnClosed.Release(); g_tsfnClosed = ThreadSafeFunction(); }
+        if (g_tsfnFocused) { g_tsfnFocused.Release(); g_tsfnFocused = ThreadSafeFunction(); }
+    if (g_tsfnMinimized) { g_tsfnMinimized.Release(); g_tsfnMinimized = ThreadSafeFunction(); }
+    if (g_tsfnRestored) { g_tsfnRestored.Release(); g_tsfnRestored = ThreadSafeFunction(); }
+    }));
+    exports.Set("isUsingFallbackEvents", Function::New(env, [](const CallbackInfo& info){
+        (void)info; return Boolean::New(info.Env(), g_usingFallbackEvents.load());
+    }));
     return exports;
 }
 
