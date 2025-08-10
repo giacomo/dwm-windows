@@ -9,6 +9,9 @@
 #include <unknwn.h>
 #include <objbase.h>
 #include <shellapi.h>
+#include <shobjidl.h>
+#include <propsys.h>
+#include <propkey.h>
 #include <vector>
 #include <map>
 #include <string>
@@ -58,6 +61,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "gdiplus.lib")
 #ifdef ENABLE_WGC
 #pragma comment(lib, "d3d11.lib")
@@ -451,12 +455,91 @@ std::string IconToBase64(HICON hIcon, int size) {
     return b64;
 }
 
+// Ensure COM for the current thread; returns true if we initialized and must uninit later
+static bool EnsureComApartment() {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(hr)) return true;
+    // If already initialized on this thread with different model, do not uninit here
+    if (hr == RPC_E_CHANGED_MODE) return false;
+    return false;
+}
+
+// Get AppUserModelID (AUMID) for a window
+static std::wstring GetAumidForWindow(HWND hwnd) {
+    std::wstring aumid;
+    IPropertyStore* store = nullptr;
+    HRESULT hr = SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&store));
+    if (SUCCEEDED(hr) && store) {
+        PROPVARIANT pv; PropVariantInit(&pv);
+        hr = store->GetValue(PKEY_AppUserModel_ID, &pv);
+        if (SUCCEEDED(hr) && pv.vt == VT_LPWSTR && pv.pwszVal) {
+            aumid.assign(pv.pwszVal);
+        }
+        PropVariantClear(&pv);
+        store->Release();
+    }
+    return aumid;
+}
+
+// Load UWP icon via shell:Appsfolder using AUMID and return as PNG data URL
+static std::string GetUwpIconFromAumid(const std::wstring& aumid, int size) {
+    if (aumid.empty()) return "data:image/png;base64,";
+    bool didInit = EnsureComApartment();
+    std::wstring parsing = L"shell:Appsfolder\\" + aumid;
+    IShellItem* psi = nullptr;
+    HRESULT hr = SHCreateItemFromParsingName(parsing.c_str(), nullptr, IID_PPV_ARGS(&psi));
+    if (FAILED(hr) || !psi) {
+        if (didInit) CoUninitialize();
+        return "data:image/png;base64,";
+    }
+    IShellItemImageFactory* pif = nullptr;
+    hr = psi->QueryInterface(IID_PPV_ARGS(&pif));
+    if (FAILED(hr) || !pif) {
+        psi->Release();
+        if (didInit) CoUninitialize();
+        return "data:image/png;base64,";
+    }
+
+    SIZE sz{ size, size };
+    HBITMAP hbmp = nullptr;
+    hr = pif->GetImage(sz, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK, &hbmp);
+    std::string result = "data:image/png;base64,";
+    if (SUCCEEDED(hr) && hbmp) {
+        result = BitmapToPngBase64(hbmp, size, size);
+        DeleteObject(hbmp);
+    }
+    pif->Release();
+    psi->Release();
+    if (didInit) CoUninitialize();
+    return result;
+}
+
 // Icon für ein Fenster abrufen (mit Cache)
 std::string GetWindowIconBase64(HWND hwnd, const std::string& exePath, int size = 32) {
     {
         std::lock_guard<std::mutex> lock(g_cacheMutex);
         auto it = g_iconCache.find(hwnd);
         if (it != g_iconCache.end()) return it->second;
+    }
+
+    // Special handling for UWP-hosted windows (ApplicationFrameHost, WhatsApp, etc.)
+    std::string cls = GetWindowClassName(hwnd);
+    std::string clsLower = cls; std::transform(clsLower.begin(), clsLower.end(), clsLower.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+    std::string exeLower = exePath; std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+    bool isAppFrame = (clsLower == "applicationframewindow");
+    bool isFrameHost = exeLower.find("\\applicationframehost.exe") != std::string::npos ||
+                       (exeLower.size() >= 24 && exeLower.rfind("applicationframehost.exe") == exeLower.size() - strlen("applicationframehost.exe"));
+    bool uwpCandidate = isAppFrame || isFrameHost || IsWhatsAppWindow(hwnd);
+    if (uwpCandidate) {
+        std::wstring aumid = GetAumidForWindow(hwnd);
+        if (!aumid.empty()) {
+            std::string uwpIcon = GetUwpIconFromAumid(aumid, size);
+            if (uwpIcon.size() > strlen("data:image/png;base64,")) {
+                std::lock_guard<std::mutex> lock(g_cacheMutex);
+                g_iconCache[hwnd] = uwpIcon;
+                return uwpIcon;
+            }
+        }
     }
 
     HICON hIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL2, 0);

@@ -12,6 +12,8 @@
                 "dwmapi.lib",
                 "psapi.lib",
                 "gdiplus.lib",
+                "shell32.lib",
+                "propsys.lib",
             ],
             "defines": [
                 "NAPI_DISABLE_CPP_EXCEPTIONS",
