@@ -1552,58 +1552,14 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
         return data.size() > strlen("data:image/png;base64,") + 8000;
     };
 
-    // If minimized, use DWM iconic/thumbnail preview; WGC cannot capture minimized content reliably
+    // If minimized, avoid mutating OS iconic thumbnails; use off-screen DWM thumbnail capture instead
     if (IsIconic(hwnd)) {
-    typedef HRESULT (WINAPI *PFN_DwmGetIconicLivePreviewBitmap)(HWND, HBITMAP*, POINT*, DWORD);
-    typedef HRESULT (WINAPI *PFN_DwmGetIconicThumbnail)(HWND, HBITMAP*, DWORD);
-    typedef HRESULT (WINAPI *PFN_DwmInvalidateIconicBitmaps)(HWND);
-        // Encourage DWM to provide an iconic representation
-        BOOL force = TRUE; DwmSetWindowAttribute(hwnd, DWMWA_FORCE_ICONIC_REPRESENTATION, &force, sizeof(force));
-            HMODULE hDwm = LoadLibraryW(L"dwmapi.dll");
-            if (hDwm) {
-                auto pLive = reinterpret_cast<PFN_DwmGetIconicLivePreviewBitmap>(GetProcAddress(hDwm, "DwmGetIconicLivePreviewBitmap"));
-                auto pThumb = reinterpret_cast<PFN_DwmGetIconicThumbnail>(GetProcAddress(hDwm, "DwmGetIconicThumbnail"));
-                auto pInvalidate = reinterpret_cast<PFN_DwmInvalidateIconicBitmaps>(GetProcAddress(hDwm, "DwmInvalidateIconicBitmaps"));
-                HBITMAP hbmp = NULL;
-                HRESULT hr = E_FAIL;
-                if (pInvalidate) {
-                    pInvalidate(hwnd);
-                }
-                if (pLive) {
-                    hr = pLive(hwnd, &hbmp, nullptr, 0);
-                }
-                if ((FAILED(hr) || !hbmp) && pThumb) {
-                    hr = pThumb(hwnd, &hbmp, 0);
-                }
-                if (SUCCEEDED(hr) && hbmp) {
-                    int bw = 0, bh = 0;
-                    if (GetBitmapSize(hbmp, bw, bh) && bw > 0 && bh > 0) {
-                        double sx = (double)maxWidth / (double)bw;
-                        double sy = (double)maxHeight / (double)bh;
-                        double s = std::min(sx, sy);
-                        int outW = std::max(1, (int)std::round(bw * s));
-                        int outH = std::max(1, (int)std::round(bh * s));
-                        HBITMAP scaled = hbmp;
-                        if (bw != outW || bh != outH) {
-                            HBITMAP tmp = ResizeBitmap(hbmp, bw, bh, outW, outH);
-                            if (tmp) scaled = tmp;
-                        }
-                        std::string base64 = BitmapToPngBase64(scaled, (bw == outW && bh == outH) ? bw : outW, (bw == outW && bh == outH) ? bh : outH);
-                        if (scaled != hbmp) DeleteObject(scaled);
-                        DeleteObject(hbmp);
-                        FreeLibrary(hDwm);
-                        // Only accept if not obviously tiny; otherwise fall through to other methods
-                        if (isGoodPngSize(base64)) return base64;
-                    } else {
-                        DeleteObject(hbmp);
-                        FreeLibrary(hDwm);
-                    }
-                } else {
-                    if (hbmp) DeleteObject(hbmp);
-                    FreeLibrary(hDwm);
-                }
-            }
-        // If DWM iconic path failed, fall through to PrintWindow fallback
+        // Prefer DwmRegisterThumbnail-based off-screen capture first
+        {
+            std::string dwmTn = CaptureWithDwmThumbnail(hwnd, maxWidth, maxHeight);
+            if (isGoodPngSize(dwmTn)) return dwmTn;
+        }
+        // If that failed, continue to non-iconic fallbacks below
     }
 
     // Preferred path for non-minimized windows (optional): Windows Graphics Capture
@@ -1619,11 +1575,7 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
     // Fenstergrößen ermitteln (für minimierte Fenster: normale Größe verwenden)
     RECT windowRect{};
     if (IsIconic(hwnd)) {
-        // Try DWM Thumbnail-based capture for minimized windows
-        {
-            std::string dwmTn = CaptureWithDwmThumbnail(hwnd, maxWidth, maxHeight);
-            if (isGoodPngSize(dwmTn)) return dwmTn;
-        }
+        // Already attempted DWM thumbnail above; if we get here, fall back to window placement size and PrintWindow/BitBlt
         WINDOWPLACEMENT wp{}; wp.length = sizeof(WINDOWPLACEMENT);
         if (GetWindowPlacement(hwnd, &wp)) {
             windowRect = wp.rcNormalPosition;
