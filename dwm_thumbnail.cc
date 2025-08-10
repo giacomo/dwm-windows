@@ -430,6 +430,41 @@ std::string BitmapToPngBase64(HBITMAP hBitmap, int width, int height) {
     return "data:image/png;base64," + base64;
 }
 
+// Get size of HBITMAP
+static bool GetBitmapSize(HBITMAP hbm, int& w, int& h) {
+    if (!hbm) return false;
+    BITMAP bm{};
+    if (GetObject(hbm, sizeof(bm), &bm) == 0) return false;
+    w = bm.bmWidth; h = bm.bmHeight;
+    return (w > 0 && h > 0);
+}
+
+// Resize an HBITMAP to destW x destH using StretchBlt; returns new HBITMAP (caller deletes)
+static HBITMAP ResizeBitmap(HBITMAP src, int srcW, int srcH, int destW, int destH) {
+    HDC hdcScreen = GetDC(NULL);
+    if (!hdcScreen) return NULL;
+    HDC srcDC = CreateCompatibleDC(hdcScreen);
+    HDC dstDC = CreateCompatibleDC(hdcScreen);
+    HBITMAP dst = CreateCompatibleBitmap(hdcScreen, destW, destH);
+    if (!srcDC || !dstDC || !dst) {
+        if (dst) DeleteObject(dst);
+        if (srcDC) DeleteDC(srcDC);
+        if (dstDC) DeleteDC(dstDC);
+        ReleaseDC(NULL, hdcScreen);
+        return NULL;
+    }
+    HGDIOBJ oldSrc = SelectObject(srcDC, src);
+    HGDIOBJ oldDst = SelectObject(dstDC, dst);
+    SetStretchBltMode(dstDC, HALFTONE);
+    StretchBlt(dstDC, 0, 0, destW, destH, srcDC, 0, 0, srcW, srcH, SRCCOPY);
+    SelectObject(srcDC, oldSrc);
+    SelectObject(dstDC, oldDst);
+    DeleteDC(srcDC);
+    DeleteDC(dstDC);
+    ReleaseDC(NULL, hdcScreen);
+    return dst;
+}
+
 // Icon (HICON) in Base64-BMP umwandeln
 std::string IconToBase64(HICON hIcon, int size) {
     if (!hIcon) return "data:image/png;base64,";
@@ -453,6 +488,95 @@ std::string IconToBase64(HICON hIcon, int size) {
     DeleteDC(hdc);
     ReleaseDC(NULL, hdcScreen);
     return b64;
+}
+
+// -------------- DWM Thumbnail off-screen capture helpers --------------
+static ATOM g_CaptureWndClass = 0;
+static const wchar_t* kCaptureWndClassName = L"DwmWin_CaptureWnd";
+
+static LRESULT CALLBACK CaptureWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_ERASEBKGND: return 1; // no flicker
+        default: return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+}
+
+static bool EnsureCaptureWindowClass() {
+    if (g_CaptureWndClass) return true;
+    WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = CaptureWndProc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = kCaptureWndClassName;
+    g_CaptureWndClass = RegisterClassExW(&wc);
+    return g_CaptureWndClass != 0;
+}
+
+static std::string CaptureWithDwmThumbnail(HWND srcHwnd, int maxWidth, int maxHeight) {
+    if (!EnsureCaptureWindowClass()) return "data:image/png;base64,";
+    // Create off-screen toolwindow
+    HWND dest = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCaptureWndClassName, L"",
+        WS_POPUP, 0, 0, maxWidth, maxHeight, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (!dest) return "data:image/png;base64,";
+
+    // Register DWM thumbnail
+    HTHUMBNAIL hThumb = NULL;
+    HRESULT hr = DwmRegisterThumbnail(dest, srcHwnd, &hThumb);
+    if (FAILED(hr) || !hThumb) {
+        DestroyWindow(dest);
+        return "data:image/png;base64,";
+    }
+
+    SIZE srcSize{};
+    if (FAILED(DwmQueryThumbnailSourceSize(hThumb, &srcSize)) || srcSize.cx <= 0 || srcSize.cy <= 0) {
+        DwmUnregisterThumbnail(hThumb);
+        DestroyWindow(dest);
+        return "data:image/png;base64,";
+    }
+
+    // Compute destination rect preserving aspect ratio
+    double sx = (double)maxWidth / (double)srcSize.cx;
+    double sy = (double)maxHeight / (double)srcSize.cy;
+    double s = std::min(sx, sy);
+    int outW = std::max(1, (int)std::round(srcSize.cx * s));
+    int outH = std::max(1, (int)std::round(srcSize.cy * s));
+    RECT destRect{ 0, 0, outW, outH };
+    // Ensure window size matches destination and place on-screen at (0,0) without activating
+    SetWindowPos(dest, HWND_BOTTOM, 0, 0, outW, outH, SWP_NOACTIVATE);
+
+    DWM_THUMBNAIL_PROPERTIES props{};
+    props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION | DWM_TNP_SOURCECLIENTAREAONLY;
+    props.fSourceClientAreaOnly = FALSE;
+    props.rcDestination = destRect;
+    DwmUpdateThumbnailProperties(hThumb, &props);
+
+    // Show (off-screen) and force paint
+    ShowWindow(dest, SW_SHOWNOACTIVATE);
+    UpdateWindow(dest);
+    DwmFlush();
+    // Allow DWM to compose; slightly longer delay for minimized sources
+    Sleep(50);
+
+    // Capture the composed thumbnail from the dest window
+    HDC hdcWindow = GetDC(dest);
+    HDC hdcMem = CreateCompatibleDC(hdcWindow);
+    HBITMAP hbm = CreateCompatibleBitmap(hdcWindow, outW, outH);
+    std::string result = "data:image/png;base64,";
+    if (hdcWindow && hdcMem && hbm) {
+        HGDIOBJ old = SelectObject(hdcMem, hbm);
+    BitBlt(hdcMem, 0, 0, outW, outH, hdcWindow, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, old);
+        result = BitmapToPngBase64(hbm, outW, outH);
+    }
+    if (hbm) DeleteObject(hbm);
+    if (hdcMem) DeleteDC(hdcMem);
+    if (hdcWindow) ReleaseDC(dest, hdcWindow);
+
+    ShowWindow(dest, SW_HIDE);
+    DwmUnregisterThumbnail(hThumb);
+    DestroyWindow(dest);
+    return result;
 }
 
 // Ensure COM for the current thread; returns true if we initialized and must uninit later
@@ -694,6 +818,59 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
         return "data:image/png;base64,";
     }
 
+    // If minimized, try DWM iconic/live preview bitmap for full-window content similar to Alt+Tab
+    if (IsIconic(hwnd)) {
+    typedef HRESULT (WINAPI *PFN_DwmGetIconicLivePreviewBitmap)(HWND, HBITMAP*, POINT*, DWORD);
+    typedef HRESULT (WINAPI *PFN_DwmGetIconicThumbnail)(HWND, HBITMAP*, DWORD);
+    typedef HRESULT (WINAPI *PFN_DwmInvalidateIconicBitmaps)(HWND);
+        // Encourage DWM to provide an iconic representation
+        BOOL force = TRUE; DwmSetWindowAttribute(hwnd, DWMWA_FORCE_ICONIC_REPRESENTATION, &force, sizeof(force));
+            HMODULE hDwm = LoadLibraryW(L"dwmapi.dll");
+            if (hDwm) {
+                auto pLive = reinterpret_cast<PFN_DwmGetIconicLivePreviewBitmap>(GetProcAddress(hDwm, "DwmGetIconicLivePreviewBitmap"));
+                auto pThumb = reinterpret_cast<PFN_DwmGetIconicThumbnail>(GetProcAddress(hDwm, "DwmGetIconicThumbnail"));
+                auto pInvalidate = reinterpret_cast<PFN_DwmInvalidateIconicBitmaps>(GetProcAddress(hDwm, "DwmInvalidateIconicBitmaps"));
+                HBITMAP hbmp = NULL;
+                HRESULT hr = E_FAIL;
+                if (pInvalidate) {
+                    pInvalidate(hwnd);
+                }
+                if (pLive) {
+                    hr = pLive(hwnd, &hbmp, nullptr, 0);
+                }
+                if ((FAILED(hr) || !hbmp) && pThumb) {
+                    hr = pThumb(hwnd, &hbmp, 0);
+                }
+                if (SUCCEEDED(hr) && hbmp) {
+                    int bw = 0, bh = 0;
+                    if (GetBitmapSize(hbmp, bw, bh) && bw > 0 && bh > 0) {
+                        double sx = (double)maxWidth / (double)bw;
+                        double sy = (double)maxHeight / (double)bh;
+                        double s = std::min(sx, sy);
+                        int outW = std::max(1, (int)std::round(bw * s));
+                        int outH = std::max(1, (int)std::round(bh * s));
+                        HBITMAP scaled = hbmp;
+                        if (bw != outW || bh != outH) {
+                            HBITMAP tmp = ResizeBitmap(hbmp, bw, bh, outW, outH);
+                            if (tmp) scaled = tmp;
+                        }
+                        std::string base64 = BitmapToPngBase64(scaled, (bw == outW && bh == outH) ? bw : outW, (bw == outW && bh == outH) ? bh : outH);
+                        if (scaled != hbmp) DeleteObject(scaled);
+                        DeleteObject(hbmp);
+                        FreeLibrary(hDwm);
+                        if (base64.size() > strlen("data:image/png;base64,")) return base64;
+                    } else {
+                        DeleteObject(hbmp);
+                        FreeLibrary(hDwm);
+                    }
+                } else {
+                    if (hbmp) DeleteObject(hbmp);
+                    FreeLibrary(hDwm);
+                }
+            }
+        // If DWM iconic path failed, fall through to PrintWindow fallback
+    }
+
     // Preferred path: Windows Graphics Capture (flicker-free)
 #ifdef ENABLE_WGC
     {
@@ -704,10 +881,24 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
     }
 #endif
 
-    // Fenstergrößen ermitteln
-    RECT windowRect;
-    if (!GetWindowRect(hwnd, &windowRect)) {
-        return "data:image/png;base64,";
+    // Fenstergrößen ermitteln (für minimierte Fenster: normale Größe verwenden)
+    RECT windowRect{};
+    if (IsIconic(hwnd)) {
+        // Try DWM Thumbnail-based capture first for minimized windows
+        {
+            std::string dwmTn = CaptureWithDwmThumbnail(hwnd, maxWidth, maxHeight);
+            if (dwmTn.size() > strlen("data:image/png;base64,")) return dwmTn;
+        }
+        WINDOWPLACEMENT wp{}; wp.length = sizeof(WINDOWPLACEMENT);
+        if (GetWindowPlacement(hwnd, &wp)) {
+            windowRect = wp.rcNormalPosition;
+        } else if (!GetWindowRect(hwnd, &windowRect)) {
+            return "data:image/png;base64,";
+        }
+    } else {
+        if (!GetWindowRect(hwnd, &windowRect)) {
+            return "data:image/png;base64,";
+        }
     }
 
     int windowWidth = windowRect.right - windowRect.left;
@@ -809,6 +1000,10 @@ std::string GetOrCaptureWindowThumbnail(HWND hwnd, int maxWidth = 200, int maxHe
     return "data:image/png;base64,";
     }
     ULONGLONG now = GetTickCount64();
+    auto isGoodPng = [](const std::string& data) {
+        // Heuristic: a 200x150 PNG is typically > 8KB (base64). Avoid caching tiny title-only captures.
+        return data.size() > strlen("data:image/png;base64,") + 8000;
+    };
     {
         std::lock_guard<std::mutex> lock(g_cacheMutex);
         auto it = g_thumbCache.find(hwnd);
@@ -822,7 +1017,26 @@ std::string GetOrCaptureWindowThumbnail(HWND hwnd, int maxWidth = 200, int maxHe
             }
         }
     }
+    // If minimized, prefer returning last good cached image if available to mimic Alt+Tab behavior
+    if (IsIconic(hwnd)) {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        auto it = g_thumbCache.find(hwnd);
+        if (it != g_thumbCache.end() && isGoodPng(it->second.base64)) {
+            return it->second.base64;
+        }
+    }
+
     std::string fresh = CaptureWindowScreenshot(hwnd, maxWidth, maxHeight);
+    if (IsIconic(hwnd) && !isGoodPng(fresh)) {
+        // Do not overwrite a good cache with a tiny minimized capture
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        auto it = g_thumbCache.find(hwnd);
+        if (it != g_thumbCache.end() && isGoodPng(it->second.base64)) {
+            return it->second.base64;
+        }
+        // No good cache exists; return the small minimized capture without caching it
+        return fresh;
+    }
     {
         std::lock_guard<std::mutex> lock(g_cacheMutex);
         g_thumbCache[hwnd] = ThumbCacheEntry{ fresh, rect, now, maxWidth, maxHeight };
@@ -1069,11 +1283,17 @@ Value UpdateThumbnail(const CallbackInfo& info) {
 
     // Neuen Screenshot erstellen
     std::string newThumbnail = CaptureWindowScreenshot(hwnd);
+    auto isGoodPng = [](const std::string& data) {
+        return data.size() > strlen("data:image/png;base64,") + 8000;
+    };
     // Cache aktualisieren
     RECT rect;
     if (GetWindowRect(hwnd, &rect)) {
         std::lock_guard<std::mutex> lock(g_cacheMutex);
-        g_thumbCache[hwnd] = ThumbCacheEntry{ newThumbnail, rect, GetTickCount64(), 200, 150 };
+        // Avoid overwriting good cache with tiny minimized captures
+        if (!(IsIconic(hwnd) && !isGoodPng(newThumbnail))) {
+            g_thumbCache[hwnd] = ThumbCacheEntry{ newThumbnail, rect, GetTickCount64(), 200, 150 };
+        }
     }
     
     return String::New(env, newThumbnail);
