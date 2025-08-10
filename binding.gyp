@@ -1,4 +1,8 @@
 {
+    "variables": {
+        # Toggle Windows Graphics Capture support: 1 (default)
+        "enable_wgc%": 1
+    },
     "targets": [
         {
             "target_name": "dwm_windows",
@@ -24,8 +28,22 @@
             "cflags!": ["-fno-exceptions"],
             "cflags_cc!": ["-fno-exceptions"],
             "msvs_settings": {
-                "VCCLCompilerTool": {"ExceptionHandling": 1, "AdditionalOptions": []}
+                "VCCLCompilerTool": {
+                    "ExceptionHandling": 1,
+                    # Use modern C++ for C++/WinRT compatibility when enabled
+                    "AdditionalOptions": ["/std:c++20"]
+                }
             },
+            "conditions": [
+                ["enable_wgc==1", {
+                    "defines": ["ENABLE_WGC"],
+                    "libraries": [
+                        "d3d11.lib",
+                        "dxgi.lib",
+                        "windowsapp.lib"
+                    ]
+                }]
+            ]
         }
     ]
 }

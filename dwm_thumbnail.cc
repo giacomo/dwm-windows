@@ -490,6 +490,52 @@ std::string IconToBase64(HICON hIcon, int size) {
     return b64;
 }
 
+// Get a reasonable HICON for a window (caller may need to DestroyIcon if extracted)
+static HICON GetBestIconHandle(HWND hwnd, const std::string& exePath, int desired) {
+    HICON hIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_BIG, 0);
+    if (!hIcon) hIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL2, 0);
+    if (!hIcon) hIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL, 0);
+    if (!hIcon) hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
+    if (!hIcon) hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
+    if (!hIcon && !exePath.empty()) {
+        std::wstring wpath = Utf8ToWide(exePath);
+        HICON extracted = NULL;
+        ExtractIconExW(wpath.c_str(), 0, &extracted, NULL, 1);
+        if (extracted) return extracted; // caller will DestroyIcon
+    }
+    return hIcon;
+}
+
+// Create a placeholder thumbnail (w x h) with centered app icon
+static std::string CreateIconPlaceholderThumbnail(HWND hwnd, const std::string& exePath, int w, int h) {
+    HDC hdcScreen = GetDC(NULL);
+    if (!hdcScreen) return "data:image/png;base64,";
+    HDC hdc = CreateCompatibleDC(hdcScreen);
+    HBITMAP hbm = CreateCompatibleBitmap(hdcScreen, w, h);
+    std::string result = "data:image/png;base64,";
+    if (hdc && hbm) {
+        HGDIOBJ old = SelectObject(hdc, hbm);
+        // Background: use window color or white
+        HBRUSH bg = (HBRUSH)GetSysColorBrush(COLOR_WINDOW);
+        RECT rc{0,0,w,h};
+        FillRect(hdc, &rc, bg);
+        int iconSize = (int)std::min<double>(std::min(w, h) * 0.6, 128.0);
+        HICON icon = GetBestIconHandle(hwnd, exePath, iconSize);
+        int x = (w - iconSize) / 2;
+        int y = (h - iconSize) / 2;
+        if (icon) {
+            DrawIconEx(hdc, x, y, icon, iconSize, iconSize, 0, NULL, DI_NORMAL);
+        }
+        result = BitmapToPngBase64(hbm, w, h);
+        SelectObject(hdc, old);
+        if (icon) DestroyIcon(icon);
+    }
+    if (hbm) DeleteObject(hbm);
+    if (hdc) DeleteDC(hdc);
+    ReleaseDC(NULL, hdcScreen);
+    return result;
+}
+
 // -------------- DWM Thumbnail off-screen capture helpers --------------
 static ATOM g_CaptureWndClass = 0;
 static const wchar_t* kCaptureWndClassName = L"DwmWin_CaptureWnd";
@@ -694,18 +740,18 @@ std::string GetWindowIconBase64(HWND hwnd, const std::string& exePath, int size 
 // Returns PNG data URL or empty PNG URL if unsupported/failure.
 std::string CaptureWindowScreenshotWGC(HWND hwnd, int maxWidth = 200, int maxHeight = 150) {
     using namespace winrt;
-    using namespace winrt::Windows::Graphics;
-    using namespace winrt::Windows::Graphics::Capture;
-    using namespace winrt::Windows::Graphics::DirectX;
-    using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
-    using namespace winrt::Windows::Graphics::Imaging;
-    using namespace winrt::Windows::Storage::Streams;
+    namespace WG = winrt::Windows::Graphics;
+    namespace WGC = winrt::Windows::Graphics::Capture;
+    namespace WGD = winrt::Windows::Graphics::DirectX;
+    namespace WGD11 = winrt::Windows::Graphics::DirectX::Direct3D11;
+    namespace WGI = winrt::Windows::Graphics::Imaging;
+    namespace WSS = winrt::Windows::Storage::Streams;
 
     WinrtInitOnce();
     if (!g_winrtInited) return "data:image/png;base64,";
 
     // Check support
-    if (!GraphicsCaptureSession::IsSupported()) {
+    if (!WGC::GraphicsCaptureSession::IsSupported()) {
         return "data:image/png;base64,";
     }
 
@@ -719,21 +765,21 @@ std::string CaptureWindowScreenshotWGC(HWND hwnd, int maxWidth = 200, int maxHei
 
     // Wrap as WinRT Direct3D device
     winrt::com_ptr<IDXGIDevice> dxgiDevice;
-    hr = d3dDevice.as(dxgiDevice);
-    if (FAILED(hr)) return "data:image/png;base64,";
-    IDirect3DDevice winrtDevice{ nullptr };
+    hr = d3dDevice->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.put_void());
+    if (FAILED(hr) || !dxgiDevice) return "data:image/png;base64,";
+    WGD11::IDirect3DDevice winrtDevice{ nullptr };
     {
         winrt::com_ptr<IInspectable> inspectable;
         HRESULT hrDev = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.get(), inspectable.put());
         if (FAILED(hrDev) || !inspectable) return "data:image/png;base64,";
-        winrtDevice = inspectable.as<IDirect3DDevice>();
+    winrtDevice = inspectable.as<WGD11::IDirect3DDevice>();
     }
 
     // Create GraphicsCaptureItem from HWND via interop
-    auto factory = winrt::get_activation_factory<GraphicsCaptureItem>();
+    auto factory = winrt::get_activation_factory<WGC::GraphicsCaptureItem>();
     auto interop = factory.as<IGraphicsCaptureItemInterop>();
-    GraphicsCaptureItem item{ nullptr };
-    hr = interop->CreateForWindow(hwnd, guid_of<GraphicsCaptureItem>(), reinterpret_cast<void**>(put_abi(item)));
+    WGC::GraphicsCaptureItem item{ nullptr };
+    hr = interop->CreateForWindow(hwnd, winrt::guid_of<WGC::GraphicsCaptureItem>(), reinterpret_cast<void**>(winrt::put_abi(item)));
     if (FAILED(hr) || !item) return "data:image/png;base64,";
 
     // Determine size
@@ -741,13 +787,13 @@ std::string CaptureWindowScreenshotWGC(HWND hwnd, int maxWidth = 200, int maxHei
     if (sz.Width <= 0 || sz.Height <= 0) return "data:image/png;base64,";
 
     // Frame pool and session
-    Direct3D11CaptureFramePool pool = Direct3D11CaptureFramePool::Create(winrtDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, sz);
-    GraphicsCaptureSession session = pool.CreateCaptureSession(item);
+    WGC::Direct3D11CaptureFramePool pool = WGC::Direct3D11CaptureFramePool::Create(winrtDevice, WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, sz);
+    WGC::GraphicsCaptureSession session = pool.CreateCaptureSession(item);
     // Optional: Hide capture border if available
     try { session.IsBorderRequired(false); } catch (...) {}
     session.StartCapture();
 
-    Direct3D11CaptureFrame frame{ nullptr };
+    WGC::Direct3D11CaptureFrame frame{ nullptr };
     // Poll a few times for a frame
     for (int i = 0; i < 30; ++i) {
         frame = pool.TryGetNextFrame();
@@ -759,11 +805,11 @@ std::string CaptureWindowScreenshotWGC(HWND hwnd, int maxWidth = 200, int maxHei
         return "data:image/png;base64,";
     }
 
-    IDirect3DSurface surface = frame.Surface();
+    WGD11::IDirect3DSurface surface = frame.Surface();
 
     // Copy to SoftwareBitmap
-    auto op = SoftwareBitmap::CreateCopyFromSurfaceAsync(surface, BitmapAlphaMode::Premultiplied);
-    SoftwareBitmap sbmp = nullptr;
+    auto op = WGI::SoftwareBitmap::CreateCopyFromSurfaceAsync(surface, WGI::BitmapAlphaMode::Premultiplied);
+    WGI::SoftwareBitmap sbmp = nullptr;
     try { sbmp = op.get(); } catch (...) { sbmp = nullptr; }
     if (!sbmp) {
         try { session.Close(); pool.Close(); } catch (...) {}
@@ -779,9 +825,9 @@ std::string CaptureWindowScreenshotWGC(HWND hwnd, int maxWidth = 200, int maxHei
     uint32_t outW = (uint32_t)std::max(1, (int)std::round(w * s));
     uint32_t outH = (uint32_t)std::max(1, (int)std::round(h * s));
 
-    InMemoryRandomAccessStream stream;
-    BitmapEncoder encoder = nullptr;
-    try { encoder = BitmapEncoder::CreateAsync(BitmapEncoder::PngEncoderId(), stream).get(); } catch (...) { encoder = nullptr; }
+    WSS::InMemoryRandomAccessStream stream;
+    WGI::BitmapEncoder encoder = nullptr;
+    try { encoder = WGI::BitmapEncoder::CreateAsync(WGI::BitmapEncoder::PngEncoderId(), stream).get(); } catch (...) { encoder = nullptr; }
     if (!encoder) {
         try { session.Close(); pool.Close(); } catch (...) {}
         return "data:image/png;base64,";
@@ -797,7 +843,7 @@ std::string CaptureWindowScreenshotWGC(HWND hwnd, int maxWidth = 200, int maxHei
     std::string base64;
     try {
         auto input = stream.GetInputStreamAt(0);
-    Windows::Storage::Streams::DataReader reader(input);
+        WSS::DataReader reader(input);
         reader.LoadAsync((uint32_t)size).get();
         std::vector<uint8_t> bytes((size_t)size);
         reader.ReadBytes(winrt::array_view<uint8_t>(bytes));
@@ -818,7 +864,12 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
         return "data:image/png;base64,";
     }
 
-    // If minimized, try DWM iconic/live preview bitmap for full-window content similar to Alt+Tab
+    auto isGoodPngSize = [](const std::string& data) {
+        // Heuristic: a 200x150 PNG is typically > ~8KB base64
+        return data.size() > strlen("data:image/png;base64,") + 8000;
+    };
+
+    // If minimized, use DWM iconic/thumbnail preview; WGC cannot capture minimized content reliably
     if (IsIconic(hwnd)) {
     typedef HRESULT (WINAPI *PFN_DwmGetIconicLivePreviewBitmap)(HWND, HBITMAP*, POINT*, DWORD);
     typedef HRESULT (WINAPI *PFN_DwmGetIconicThumbnail)(HWND, HBITMAP*, DWORD);
@@ -858,7 +909,8 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
                         if (scaled != hbmp) DeleteObject(scaled);
                         DeleteObject(hbmp);
                         FreeLibrary(hDwm);
-                        if (base64.size() > strlen("data:image/png;base64,")) return base64;
+                        // Only accept if not obviously tiny; otherwise fall through to other methods
+                        if (isGoodPngSize(base64)) return base64;
                     } else {
                         DeleteObject(hbmp);
                         FreeLibrary(hDwm);
@@ -871,9 +923,9 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
         // If DWM iconic path failed, fall through to PrintWindow fallback
     }
 
-    // Preferred path: Windows Graphics Capture (flicker-free)
+    // Preferred path for non-minimized windows (optional): Windows Graphics Capture
 #ifdef ENABLE_WGC
-    {
+    if (!IsIconic(hwnd)) {
         std::string wgc = CaptureWindowScreenshotWGC(hwnd, maxWidth, maxHeight);
         if (wgc.size() > strlen("data:image/png;base64,")) {
             return wgc;
@@ -884,10 +936,10 @@ std::string CaptureWindowScreenshot(HWND hwnd, int maxWidth = 200, int maxHeight
     // Fenstergrößen ermitteln (für minimierte Fenster: normale Größe verwenden)
     RECT windowRect{};
     if (IsIconic(hwnd)) {
-        // Try DWM Thumbnail-based capture first for minimized windows
+        // Try DWM Thumbnail-based capture for minimized windows
         {
             std::string dwmTn = CaptureWithDwmThumbnail(hwnd, maxWidth, maxHeight);
-            if (dwmTn.size() > strlen("data:image/png;base64,")) return dwmTn;
+            if (isGoodPngSize(dwmTn)) return dwmTn;
         }
         WINDOWPLACEMENT wp{}; wp.length = sizeof(WINDOWPLACEMENT);
         if (GetWindowPlacement(hwnd, &wp)) {
@@ -1034,8 +1086,11 @@ std::string GetOrCaptureWindowThumbnail(HWND hwnd, int maxWidth = 200, int maxHe
         if (it != g_thumbCache.end() && isGoodPng(it->second.base64)) {
             return it->second.base64;
         }
-        // No good cache exists; return the small minimized capture without caching it
-        return fresh;
+        // No good cache exists; create an icon placeholder instead of tiny minimized capture
+        // Need the exe path to fetch an icon; recompute cheaply
+        std::string exePath = GetExecutablePath(hwnd);
+        std::string placeholder = CreateIconPlaceholderThumbnail(hwnd, exePath, maxWidth, maxHeight);
+        return placeholder.size() > strlen("data:image/png;base64,") ? placeholder : fresh;
     }
     {
         std::lock_guard<std::mutex> lock(g_cacheMutex);
