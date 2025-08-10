@@ -1,9 +1,9 @@
 export interface WindowInfo {
-  id: number;
+  id: number; // equals hwnd (native window handle)
   title: string;
   executablePath: string;
   isVisible: boolean;
-  hwnd: number;
+  hwnd: number; // same as id
   thumbnail: string; // data URL (PNG base64)
   icon: string; // data URL (PNG base64)
 }

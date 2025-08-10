@@ -36,9 +36,9 @@ for (const w of all) {
 
 
 // compare current and all and get the different
-const currentIds = current.map(w => w.title + ' | ' + w.executablePath);
-const allIds = all.map(w => w.title + ' | ' + w.executablePath);
-const different = all.filter(w => !currentIds.includes(w.title + ' | ' + w.executablePath));
+// id equals hwnd (native handle), stable while the window exists
+const currentIds = new Set(current.map(w => w.id));
+const different = all.filter(w => !currentIds.has(w.id));
 console.log(`\nDifferent windows (not on current desktop): ${different.length}`);
 for (const w of different) console.log(`- ${w.title} (${w.executablePath})`);
 

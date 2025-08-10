@@ -93,8 +93,6 @@ struct WindowInfo {
     bool isVisible;
 };
 
-std::map<uint64_t, WindowInfo> registeredWindows;
-uint64_t nextWindowId = 1;
 
 // GDI+ global token
 static ULONG_PTR g_gdiplusToken = 0;
@@ -134,7 +132,7 @@ static const ULONGLONG THUMB_TTL_MS = 800; // Cache thumbnails for ~0.8s
 static std::mutex g_cacheMutex; // Protects g_thumbCache and g_iconCache
 
 // Registered windows mapping and id counter (shared with async workers)
-static std::mutex g_stateMutex; // Protects registeredWindows and nextWindowId
+// No longer need a global map of IDs; id is the HWND itself
 
 // Minimal IVirtualDesktopManager Definition, um Header-Abhängigkeiten zu vermeiden
 // {AA509086-5CA9-4C25-8F95-589D3C07B48A}
@@ -805,10 +803,24 @@ static bool IsAltTabEligible(HWND hwnd, bool includeAllDesktops) {
         if (IsWindowCloaked(hwnd)) return false;
     }
 
-    // Größe muss sinnvoll sein
+    // Größe muss sinnvoll sein. Für minimierte Fenster nutze die normale (restored) Größe.
     RECT rect{};
-    if (!GetWindowRect(hwnd, &rect)) return false;
-    if ((rect.right - rect.left) < 50 || (rect.bottom - rect.top) < 50) return false;
+    bool haveRect = false;
+    if (IsIconic(hwnd)) {
+        WINDOWPLACEMENT wp{};
+        wp.length = sizeof(WINDOWPLACEMENT);
+        if (GetWindowPlacement(hwnd, &wp)) {
+            rect = wp.rcNormalPosition;
+            haveRect = true;
+        }
+    }
+    if (!haveRect) {
+        if (!GetWindowRect(hwnd, &rect)) return false;
+        haveRect = true;
+    }
+    int rectW = rect.right - rect.left;
+    int rectH = rect.bottom - rect.top;
+    if (rectW < 50 || rectH < 50) return false;
 
     return true;
 }
@@ -882,7 +894,8 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     info.title = title;
     info.executablePath = execPath;
     // Sichtbarkeit separat bestimmen (kann auf anderem Desktop false sein)
-    info.isVisible = IsWindowVisible(hwnd) && !IsIconic(hwnd);
+    // Consider minimized windows as visible for Task View-like behavior
+    info.isVisible = IsWindowVisible(hwnd);
 
     ctx->windows->push_back(info);
     return TRUE;
@@ -933,15 +946,11 @@ Value GetWindows(const CallbackInfo& info) {
     
     for (size_t i = 0; i < windows.size(); i++) {
         const WindowInfo& window = windows[i];
-        uint64_t windowId = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_stateMutex);
-            windowId = nextWindowId++;
-            registeredWindows[windowId] = window;
-        }
-        
+        // Use HWND as the public id
+        uint64_t hwndId = (uint64_t)(uintptr_t)window.hwnd;
+
         Object windowObj = Object::New(env);
-        windowObj.Set("id", Number::New(env, windowId));
+        windowObj.Set("id", Number::New(env, hwndId));
         windowObj.Set("title", String::New(env, window.title));
         windowObj.Set("executablePath", String::New(env, window.executablePath));
         windowObj.Set("isVisible", Boolean::New(env, window.isVisible));
@@ -969,19 +978,9 @@ Value UpdateThumbnail(const CallbackInfo& info) {
     }
     
     uint64_t windowId = info[0].As<Number>().Int64Value();
-    
-    HWND hwnd = NULL;
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        auto it = registeredWindows.find(windowId);
-        if (it == registeredWindows.end()) {
-            Error::New(env, "Window ID not found").ThrowAsJavaScriptException();
-            return env.Null();
-        }
-        hwnd = it->second.hwnd;
-    }
-    if (!hwnd) {
-        Error::New(env, "Window ID not found").ThrowAsJavaScriptException();
+    HWND hwnd = (HWND)(uintptr_t)windowId;
+    if (!hwnd || !IsWindow(hwnd)) {
+        Error::New(env, "Window ID not found or invalid").ThrowAsJavaScriptException();
         return env.Null();
     }
 
@@ -1007,19 +1006,9 @@ Value OpenWindow(const CallbackInfo& info) {
     }
     
     uint64_t windowId = info[0].As<Number>().Int64Value();
-    
-    HWND hwnd = NULL;
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        auto it = registeredWindows.find(windowId);
-        if (it == registeredWindows.end()) {
-            Error::New(env, "Window ID not found").ThrowAsJavaScriptException();
-            return env.Null();
-        }
-        hwnd = it->second.hwnd;
-    }
+    HWND hwnd = (HWND)(uintptr_t)windowId;
     if (!hwnd) {
-        Error::New(env, "Window ID not found").ThrowAsJavaScriptException();
+        Error::New(env, "Window ID not found or invalid").ThrowAsJavaScriptException();
         return env.Null();
     }
     
@@ -1103,13 +1092,8 @@ public:
         Napi::Env env = this->Env();
         Array arr = Array::New(env, results.size());
         for (size_t i = 0; i < results.size(); ++i) {
-            uint64_t id = 0;
-            // Register window id on main thread for safety
-            {
-                std::lock_guard<std::mutex> lock(g_stateMutex);
-                id = nextWindowId++;
-                registeredWindows[id] = WindowInfo{ results[i].hwnd, results[i].title, results[i].executablePath, results[i].isVisible };
-            }
+            // Use HWND value as id
+            uint64_t id = (uint64_t)(uintptr_t)results[i].hwnd;
             Object o = Object::New(env);
             o.Set("id", Number::New(env, id));
             o.Set("title", String::New(env, results[i].title));
@@ -1134,13 +1118,8 @@ public:
         : PromiseWorker(env), windowId(id) {}
 
     void Execute() override {
-        // Copy HWND under lock
-        HWND hwndLocal = NULL;
-        {
-            std::lock_guard<std::mutex> lock(g_stateMutex);
-            auto it = registeredWindows.find(windowId);
-            if (it != registeredWindows.end()) hwndLocal = it->second.hwnd;
-        }
+    // Interpret windowId as HWND directly
+    HWND hwndLocal = (HWND)(uintptr_t)windowId;
         if (!hwndLocal || !IsWindow(hwndLocal)) {
             SetError("Window ID not found or invalid");
             return;
@@ -1170,12 +1149,7 @@ public:
         : PromiseWorker(env), windowId(id) {}
 
     void Execute() override {
-        HWND hwndLocal = NULL;
-        {
-            std::lock_guard<std::mutex> lock(g_stateMutex);
-            auto it = registeredWindows.find(windowId);
-            if (it != registeredWindows.end()) hwndLocal = it->second.hwnd;
-        }
+    HWND hwndLocal = (HWND)(uintptr_t)windowId;
         if (!hwndLocal || !IsWindow(hwndLocal)) {
             SetError("Window ID not found or invalid");
             return;

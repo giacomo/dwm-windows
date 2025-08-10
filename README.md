@@ -85,11 +85,11 @@ Filters windows by executable name (e.g., "notepad.exe").
 
 ```typescript
 interface WindowInfo {
-  id: number;                // Unique window identifier
+  id: number;                // HWND as number (same as hwnd)
   title: string;             // Window title
   executablePath: string;    // Full path to executable
   isVisible: boolean;        // Visibility state
-  hwnd: number;             // Windows handle
+  hwnd: number;             // Windows handle (same as id)
   thumbnail: string;        // PNG thumbnail (base64 data URL)
   icon: string;             // App icon (base64 data URL)
 }
@@ -106,7 +106,7 @@ const currentDesktop = dwmWindows.getVisibleWindows();
 const allDesktops = dwmWindows.getVisibleWindows({ includeAllDesktops: true });
 
 // Find windows that exist on other desktops but not current one
-// Note: IDs are generated per call, so we compare by title + executable
+// Note: id equals hwnd (native handle), which is stable for the window's lifetime
 const currentWindowKeys = new Set(
   currentDesktop.map(w => `${w.title}|${w.executablePath}`)
 );

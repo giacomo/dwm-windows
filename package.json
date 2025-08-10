@@ -11,7 +11,8 @@
     "postinstall": "node-gyp rebuild",
     "clean": "node-gyp clean && rimraf dist",
     "dev": "tsc --watch",
-    "example": "tsc && node dist/example.js",
+  "example": "tsc && node dist/example.js",
+  "examples": "yarn example",
     "test": "tsc && node -e \"console.log('Testing module...'); import('./dist/index.js').then(m => { const windows = m.default.getWindows(); console.log('Found', windows.length, 'windows'); })\"",
     "gyp-rebuild": "node-gyp clean && node-gyp configure && node-gyp build"
   },
